@@ -1,0 +1,14 @@
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+.claude/
+node_modules/
+__pycache__/
+*.pyc
+
+# Local data dumps (don't commit raw Waze JSONs / generated reports)
+*.json
+*.xlsx
+!waze_routes_v2.xlsx

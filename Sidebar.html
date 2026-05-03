@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html dir="rtl" lang="he">
+<head>
+<meta charset="UTF-8">
+<style>
+  body {
+    font-family: 'Segoe UI', Arial, sans-serif;
+    direction: rtl; background: #f8fafc;
+    margin: 0; padding: 14px;
+    font-size: 13px; color: #1e293b;
+  }
+  h2 { font-size: 15px; font-weight: 700; color: #1F3864; margin: 0 0 10px; }
+
+  .tabs { display: flex; gap: 4px; background: #e2e8f0; padding: 4px; border-radius: 8px; margin-bottom: 12px; }
+  .tab { flex: 1; padding: 7px; text-align: center; cursor: pointer; border-radius: 5px;
+         font-size: 12px; font-weight: 600; color: #64748b; transition: all .15s; }
+  .tab.active { background: #1F3864; color: #fff; }
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  .status-card {
+    background: #fff; border: 1px solid #e2e8f0; border-radius: 8px;
+    padding: 10px 12px; margin-bottom: 12px; font-size: 11px; color: #475569;
+    line-height: 1.7;
+  }
+  .status-card strong { color: #1F3864; }
+  .status-card .row { display: flex; justify-content: space-between; }
+
+  .drop-zone {
+    border: 2px dashed #94a3b8; border-radius: 10px;
+    padding: 22px 14px; text-align: center; background: #fff;
+    cursor: pointer; transition: all .15s; margin-bottom: 10px;
+  }
+  .drop-zone:hover, .drop-zone.drag-over { border-color: #2E75B6; background: #EFF6FF; }
+  .drop-zone .icon { font-size: 26px; margin-bottom: 4px; }
+  .drop-zone .label { color: #64748b; font-size: 12px; }
+  .drop-zone .label strong { color: #2E75B6; }
+  #fileInput { display: none; }
+
+  .file-name {
+    background: #f1f5f9; border-radius: 6px; padding: 7px 9px;
+    font-size: 11px; color: #475569; margin-bottom: 8px;
+    display: none; align-items: center; gap: 5px;
+  }
+
+  label { display: block; font-size: 11px; font-weight: 600; color: #475569;
+          margin: 10px 0 4px; }
+  input[type=date], input[type=number], select {
+    width: 100%; padding: 6px 8px; border: 1px solid #cbd5e1;
+    border-radius: 6px; font-size: 12px; font-family: inherit; box-sizing: border-box;
+  }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .days { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+  .day-btn { padding: 4px 9px; border-radius: 5px; background: #fff;
+             border: 1px solid #cbd5e1; cursor: pointer; font-size: 11px; user-select: none; }
+  .day-btn.active { background: #1F3864; color: #fff; border-color: #1F3864; }
+
+  .btn { width: 100%; padding: 9px; border: none; border-radius: 7px;
+         font-size: 13px; font-weight: 700; cursor: pointer;
+         background: #1F3864; color: #fff; margin-top: 12px; transition: opacity .15s; }
+  .btn:hover { opacity: .88; }
+  .btn:disabled { opacity: .4; cursor: default; }
+  .btn.secondary { background: #fff; color: #1F3864; border: 1px solid #1F3864; }
+
+  .status {
+    margin-top: 10px; padding: 8px 10px; border-radius: 7px;
+    font-size: 11px; line-height: 1.5; display: none; white-space: pre-line;
+  }
+  .status.error   { background: #FEE2E2; color: #991b1b; }
+  .status.success { background: #D1FAE5; color: #065f46; }
+  .status.loading { background: #EFF6FF; color: #1e40af; }
+</style>
+</head>
+<body>
+
+<h2>🚦 Waze — בקרה</h2>
+
+<div class="status-card" id="statusCard">טוען...</div>
+
+<div class="tabs">
+  <div class="tab active" data-tab="upload">📤 העלאה</div>
+  <div class="tab" data-tab="filter">🔍 סינון</div>
+  <div class="tab" data-tab="auto">⚡ אוטומציה</div>
+</div>
+
+<!-- ─── UPLOAD PANEL ─── -->
+<div class="panel active" id="panel-upload">
+  <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
+    <div class="icon">📂</div>
+    <div class="label">גרור JSON / TXT לכאן<br>או <strong>לחץ לבחירה</strong></div>
+    <input type="file" id="fileInput" accept=".json,.txt,application/json,text/plain">
+  </div>
+  <div class="file-name" id="fileName">
+    <span>📄</span><span id="fileNameText"></span>
+  </div>
+  <button class="btn" id="uploadBtn" disabled onclick="doUpload()">הוסף לארכיון</button>
+  <div class="status" id="uploadStatus"></div>
+</div>
+
+<!-- ─── FILTER PANEL ─── -->
+<div class="panel" id="panel-filter">
+  <label>מתאריך</label>
+  <input type="date" id="fromDate">
+  <label>עד תאריך</label>
+  <input type="date" id="toDate">
+  <div class="row2">
+    <div>
+      <label>משעה</label>
+      <input type="number" id="fromHour" min="0" max="23" value="0">
+    </div>
+    <div>
+      <label>עד שעה</label>
+      <input type="number" id="toHour" min="0" max="23" value="23">
+    </div>
+  </div>
+  <label>ימי שבוע</label>
+  <div class="days" id="daysContainer"></div>
+
+  <button class="btn" onclick="doFilter()">החל סינון ובנה גיליונות</button>
+  <button class="btn secondary" onclick="resetFilter()">אפס סינון</button>
+  <div class="status" id="filterStatus"></div>
+</div>
+
+<!-- ─── AUTOMATION PANEL ─── -->
+<div class="panel" id="panel-auto">
+  <label>URL של ה-JSON</label>
+  <input type="text" id="autoUrl" placeholder="https://...">
+
+  <label>כותרות (Headers) — אופציונלי</label>
+  <textarea id="autoHeaders" rows="3" style="width:100%;padding:6px 8px;border:1px solid #cbd5e1;border-radius:6px;font-size:11px;font-family:monospace;direction:ltr;text-align:left;box-sizing:border-box;resize:vertical"
+    placeholder='{"Authorization":"Bearer TOKEN"}'></textarea>
+
+  <button class="btn" onclick="doFetchNow()">🔄 שלוף עכשיו (פעם אחת)</button>
+
+  <label style="margin-top:14px">תזמון אוטומטי</label>
+  <select id="autoInterval" style="width:100%;padding:7px;border:1px solid #cbd5e1;border-radius:6px;font-size:12px">
+    <option value="off">כבוי</option>
+    <option value="30min">כל 30 דקות</option>
+    <option value="1h">כל שעה</option>
+    <option value="4h">כל 4 שעות</option>
+    <option value="1d">פעם ביום (07:00)</option>
+  </select>
+
+  <button class="btn" onclick="doSaveSchedule()">💾 שמור תזמון</button>
+
+  <div id="ownerStatus" style="margin-top:12px;padding:10px 12px;background:#fff;border:1px solid #e2e8f0;border-radius:7px;font-size:11px;color:#475569;line-height:1.7;display:none"></div>
+
+  <button class="btn" id="activateBtn" onclick="doActivateHere()" style="display:none;background:#0EA5E9;margin-top:8px">
+    🔁 הפעל תזמון בחשבון הזה
+  </button>
+
+  <div class="status" id="autoStatus"></div>
+  <div style="margin-top:12px;padding:8px 10px;background:#fff;border:1px solid #e2e8f0;border-radius:7px;font-size:10px;color:#64748b;line-height:1.6">
+    <strong style="color:#1F3864">הערה:</strong> ה-Trigger קשור לחשבון Google שיצר אותו.
+    בעבודה מחשבון אחר — לחץ "הפעל תזמון בחשבון הזה" כדי שהריצות יבוצעו גם דרכו.
+  </div>
+</div>
+
+<script>
+  var fileContent = null;
+  var DAYS = ['ראשון','שני','שלישי','רביעי','חמישי','שישי','שבת'];
+  var selectedDays = new Set();
+
+  // Tabs
+  document.querySelectorAll('.tab').forEach(function(t) {
+    t.onclick = function() {
+      document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('active');});
+      document.querySelectorAll('.panel').forEach(function(x){x.classList.remove('active');});
+      t.classList.add('active');
+      document.getElementById('panel-' + t.dataset.tab).classList.add('active');
+    };
+  });
+
+  // Days picker
+  var daysC = document.getElementById('daysContainer');
+  DAYS.forEach(function(d) {
+    var b = document.createElement('div');
+    b.className = 'day-btn'; b.textContent = d;
+    b.onclick = function() {
+      if (selectedDays.has(d)) { selectedDays.delete(d); b.classList.remove('active'); }
+      else { selectedDays.add(d); b.classList.add('active'); }
+    };
+    daysC.appendChild(b);
+  });
+
+  // File handling
+  var dropZone = document.getElementById('dropZone');
+  var fileInput = document.getElementById('fileInput');
+  var uploadBtn = document.getElementById('uploadBtn');
+  var fileNameEl = document.getElementById('fileName');
+  var fileNameText = document.getElementById('fileNameText');
+
+  fileInput.addEventListener('change', function(e) { handleFile(e.target.files[0]); });
+  dropZone.addEventListener('dragover', function(e) { e.preventDefault(); dropZone.classList.add('drag-over'); });
+  dropZone.addEventListener('dragleave', function() { dropZone.classList.remove('drag-over'); });
+  dropZone.addEventListener('drop', function(e) {
+    e.preventDefault(); dropZone.classList.remove('drag-over');
+    handleFile(e.dataTransfer.files[0]);
+  });
+
+  function handleFile(file) {
+    if (!file) return;
+    var name = file.name.toLowerCase();
+    if (!name.endsWith('.json') && !name.endsWith('.txt')) {
+      showStatus('uploadStatus', 'יש לבחור קובץ JSON או TXT', 'error'); return;
+    }
+    var reader = new FileReader();
+    reader.onload = function(e) {
+      var text = (e.target.result || '').trim();
+      try {
+        JSON.parse(text);
+        fileContent = text;
+        fileNameText.textContent = file.name;
+        fileNameEl.style.display = 'flex';
+        uploadBtn.disabled = false;
+        hideStatus('uploadStatus');
+      } catch(ex) {
+        showStatus('uploadStatus', 'JSON לא תקין: ' + ex.message, 'error');
+        fileContent = null; uploadBtn.disabled = true;
+      }
+    };
+    reader.readAsText(file);
+  }
+
+  function doUpload() {
+    if (!fileContent) return;
+    uploadBtn.disabled = true;
+    showStatus('uploadStatus', 'מעבד ומצרף לארכיון...', 'loading');
+    google.script.run
+      .withSuccessHandler(function(r) {
+        uploadBtn.disabled = false;
+        if (r.ok) {
+          showStatus('uploadStatus',
+            '✅ הוסף לארכיון\nדגימה: ' + r.ts +
+            '\nפקקים: ' + r.jams +
+            '\nסה"כ דגימות: ' + r.totalSnapshots,
+            'success');
+          loadStatus();
+        } else {
+          showStatus('uploadStatus', '❌ ' + r.error, 'error');
+        }
+      })
+      .withFailureHandler(function(err) {
+        uploadBtn.disabled = false;
+        showStatus('uploadStatus', '❌ ' + err.message, 'error');
+      })
+      .processWazeJSON(fileContent);
+  }
+
+  function doFilter() {
+    var filter = {
+      fromDate: document.getElementById('fromDate').value || null,
+      toDate:   document.getElementById('toDate').value || null,
+      fromHour: parseInt(document.getElementById('fromHour').value) || 0,
+      toHour:   parseInt(document.getElementById('toHour').value) || 23,
+      days:     Array.from(selectedDays),
+    };
+    showStatus('filterStatus', 'בונה גיליונות...', 'loading');
+    google.script.run
+      .withSuccessHandler(function(r) {
+        if (r.ok) showStatus('filterStatus', '✅ נבנו ' + r.jams + ' רשומות', 'success');
+        else showStatus('filterStatus', '❌ ' + r.error, 'error');
+      })
+      .withFailureHandler(function(err) {
+        showStatus('filterStatus', '❌ ' + err.message, 'error');
+      })
+      .applyFilter(filter);
+  }
+
+  function doFetchNow() {
+    var url = document.getElementById('autoUrl').value.trim();
+    var headers = document.getElementById('autoHeaders').value.trim();
+    if (!url) { showStatus('autoStatus', 'יש להזין URL', 'error'); return; }
+    showStatus('autoStatus', 'שולף... ⏳', 'loading');
+    google.script.run
+      .withSuccessHandler(function(r) {
+        if (r.ok) {
+          showStatus('autoStatus',
+            '✅ הוסף לארכיון\nדגימה: ' + r.ts + '\nפקקים: ' + r.jams +
+            '\nסה"כ: ' + r.totalSnapshots, 'success');
+          loadStatus();
+        } else if (r.duplicate) {
+          showStatus('autoStatus', '⚠️ ' + r.error, 'error');
+        } else {
+          showStatus('autoStatus', '❌ ' + r.error, 'error');
+        }
+      })
+      .withFailureHandler(function(err) {
+        showStatus('autoStatus', '❌ ' + err.message, 'error');
+      })
+      .fetchFromUrl(url, headers);
+  }
+
+  function doSaveSchedule() {
+    var url = document.getElementById('autoUrl').value.trim();
+    var headers = document.getElementById('autoHeaders').value.trim();
+    var interval = document.getElementById('autoInterval').value;
+    if (interval !== 'off' && !url) {
+      showStatus('autoStatus', 'יש להזין URL לפני תזמון', 'error'); return;
+    }
+    showStatus('autoStatus', 'שומר תזמון...', 'loading');
+    google.script.run
+      .withSuccessHandler(function(r) {
+        if (r.ok) {
+          showStatus('autoStatus',
+            r.scheduled ? '✅ תזמון פעיל' : '✅ תזמון בוטל', 'success');
+        } else {
+          showStatus('autoStatus', '❌ ' + r.error, 'error');
+        }
+      })
+      .withFailureHandler(function(err) {
+        showStatus('autoStatus', '❌ ' + err.message, 'error');
+      })
+      .setSchedule(url, headers, interval);
+  }
+
+  function loadScheduleConfig() {
+    google.script.run.withSuccessHandler(function(c) {
+      document.getElementById('autoUrl').value = c.url || '';
+      document.getElementById('autoHeaders').value = c.headers || '';
+      document.getElementById('autoInterval').value = c.interval || 'off';
+
+      var ownerEl = document.getElementById('ownerStatus');
+      var activateBtn = document.getElementById('activateBtn');
+      var off = !c.interval || c.interval === 'off';
+
+      if (off) {
+        ownerEl.style.display = 'block';
+        ownerEl.innerHTML = '<span style="color:#94a3b8">⏸ תזמון כבוי</span>';
+        activateBtn.style.display = 'none';
+        return;
+      }
+
+      ownerEl.style.display = 'block';
+      var lines = [];
+      if (c.hasTriggerHere) {
+        lines.push('<span style="color:#10B981">✅ תזמון פעיל בחשבון הזה</span>');
+        if (c.currentUser) lines.push('<span style="color:#94a3b8">' + c.currentUser + '</span>');
+        activateBtn.style.display = 'none';
+      } else if (c.owner && c.owner !== c.currentUser) {
+        lines.push('<span style="color:#F59E0B">⚠️ תזמון מוגדר אבל קשור לחשבון אחר</span>');
+        lines.push('<b>בעלים:</b> ' + (c.owner || '—'));
+        lines.push('<b>חשבון נוכחי:</b> ' + (c.currentUser || '—'));
+        lines.push('<span style="color:#94a3b8;font-size:10px">לחץ למטה כדי להעביר את התזמון לחשבון הנוכחי</span>');
+        activateBtn.style.display = 'block';
+      } else {
+        lines.push('<span style="color:#F59E0B">⚠️ תזמון מוגדר, אבל אין trigger פעיל בחשבון הזה</span>');
+        activateBtn.style.display = 'block';
+      }
+      ownerEl.innerHTML = lines.join('<br>');
+    }).getScheduleConfig();
+  }
+
+  function doActivateHere() {
+    showStatus('autoStatus', 'מפעיל תזמון בחשבון הנוכחי...', 'loading');
+    google.script.run
+      .withSuccessHandler(function(r) {
+        if (r.ok) {
+          showStatus('autoStatus', '✅ תזמון פעיל כעת בחשבון הנוכחי', 'success');
+          loadScheduleConfig();
+        } else {
+          showStatus('autoStatus', '❌ ' + r.error, 'error');
+        }
+      })
+      .withFailureHandler(function(err) {
+        showStatus('autoStatus', '❌ ' + err.message, 'error');
+      })
+      .activateTriggerHere();
+  }
+
+  function resetFilter() {
+    document.getElementById('fromDate').value = '';
+    document.getElementById('toDate').value = '';
+    document.getElementById('fromHour').value = '0';
+    document.getElementById('toHour').value = '23';
+    selectedDays.clear();
+    document.querySelectorAll('.day-btn').forEach(function(b){b.classList.remove('active');});
+    hideStatus('filterStatus');
+  }
+
+  // Status card (top)
+  function loadStatus() {
+    google.script.run.withSuccessHandler(function(s) {
+      var html = '<div class="row"><span><strong>דגימות בארכיון:</strong></span><span>' + s.snapshots + '</span></div>' +
+                 '<div class="row"><span><strong>סה"כ פקקים:</strong></span><span>' + s.jams + '</span></div>';
+      if (s.dateRange) {
+        html += '<div class="row"><span><strong>טווח:</strong></span><span>' + s.dateRange.from + ' — ' + s.dateRange.to + '</span></div>';
+      } else {
+        html += '<div style="margin-top:4px;color:#94a3b8">אין נתונים בארכיון. העלה JSON להתחלה.</div>';
+      }
+      document.getElementById('statusCard').innerHTML = html;
+
+      // Pre-fill filter dates if archive exists
+      if (s.dateRange && !document.getElementById('fromDate').value) {
+        document.getElementById('fromDate').value = s.dateRange.from;
+        document.getElementById('toDate').value = s.dateRange.to;
+      }
+    }).getStatus();
+  }
+  function showStatus(id, msg, type) {
+    var el = document.getElementById(id);
+    el.textContent = msg; el.className = 'status ' + type; el.style.display = 'block';
+  }
+  function hideStatus(id) { document.getElementById(id).style.display = 'none'; }
+
+  loadStatus();
+  loadScheduleConfig();
+</script>
+</body>
+</html>
