@@ -874,6 +874,13 @@ function _runArchiveSlice() {
   var startedAt = Date.now();
 
   while (job.nextRow <= job.totalRows) {
+    // Cooperative cancel check: if the job was cleared externally
+    // (menuCancelArchiveJob), abort without overwriting state.
+    var current = _getArchiveJob();
+    if (!current || current.filename !== job.filename) {
+      Logger.log('Archive slice aborted: job was cancelled externally');
+      return { ok: false, cancelled: true };
+    }
     if (Date.now() - startedAt > ARCHIVE_TIME_BUDGET_MS) {
       _setArchiveJob(job);
       _scheduleArchiveContinuation();
