@@ -5,18 +5,18 @@ Google Sheets + Apps Script tool for archiving and analyzing raw Waze API JSON s
 ## What it does
 
 - **Ingests** raw Waze API JSON (manual upload or scheduled URL fetch)
-- **Accumulates** a 30-day rolling archive with snapshot-level deduplication (by `startTime`)
+- **Accumulates** a 30-day rolling raw archive (`raw_data`) + a **permanent aggregated archive** (`_baseline_archive`) that survives pruning
 - **Filters** the archive by date range, hour-of-day, and day-of-week
-- **Computes baselines** from the archive (per route × direction × time-bin) and falls back to general / theoretical comparisons when historical data is sparse
+- **Computes baselines** from the permanent archive (per route × direction × **hour** × **weekday/weekend**) with neighbor-window fallback (±1h, ±2h). When no historical data exists for a time-point, reports "אין מספיק נתונים" rather than comparing against an irrelevant baseline.
 - **Renders** 8 sheets driven by an interactive sidebar:
   - 🎯 לוח מחוונים (Dashboard) — KPI strip, top 10 worst routes, best 5, section breakdown, analysis quality indicator
   - סיכום מסלולים — per-route summary with deviation vs historical average
-  - פירוט לפי מרווח זמן — time-bin breakdown with smart hour-vs-general baseline switching
+  - פירוט לפי שעה — hour-by-hour breakdown with same-time comparisons (weekday vs weekend separated)
   - השוואת כיוונים — direction comparison
   - חריגות — anomaly detection (1.5σ + low speed + high level)
   - פירוט פקקים — full jam log
-  - אגרגציה לאורך זמן — trends across the full archive
-  - מקרא — legend
+  - אגרגציה לאורך זמן — long-term trends from the permanent archive
+  - מקרא ומתודולוגיה — legend + full methodology documentation
 - **Auto-fetches** from a configured URL on a schedule (30 min / hourly / 4 hr / daily) — schedule config persists in the spreadsheet itself, with a flow for re-activating the trigger when switching Google accounts
 
 ## Files
@@ -58,12 +58,17 @@ Google Sheets + Apps Script tool for archiving and analyzing raw Waze API JSON s
 
 | Sheet | Persistence | Purpose |
 |-------|-------------|---------|
-| `raw_data` | append-only, auto-pruned > 30 days | one row per jam per snapshot |
+| `raw_data` | append-only, auto-pruned > 30 days | one row per jam per snapshot. Extra cols: `route_name`, `dir_ix`, `archived` (flag) |
+| `_baseline_archive` | hidden, **permanent** | aggregated counters per `(route, dir, date, hour)` — `n, sum_delay_s, sum_speed, sum_level`. Source of truth for all historical baselines. |
 | `מקור` | append-only, auto-pruned | log of every upload (`startTime`, jam count) |
 | `_config` | hidden | URL, headers, interval, trigger owner — persists across users/devices |
 | `_fetch_log` | hidden | log of every scheduled fetch (timestamp, user, status, error) |
 | `_filter` | hidden | last applied filter |
 | Analysis sheets (8) | rebuilt on each filter apply | derived views |
+
+### Migrating from a pre-archive snapshot
+
+If you're upgrading an existing sheet that has `raw_data` but no `_baseline_archive`: run **🚦 Waze → 🔄 העבר נתונים קיימים לארכיון אגרגטיבי** from the menu. It walks `raw_data` once, resolves each row's route+direction, populates `_baseline_archive`, and flags the rows so they aren't double-counted later.
 
 ## Deduplication
 
