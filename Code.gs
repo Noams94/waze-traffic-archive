@@ -179,7 +179,9 @@ function applyFilter(filter) {
     _sheet5_detail(ss, raw);
     _sheet6_legend(ss);
     ss.getSheetByName('🎯 לוח מחוונים').activate();
-    return { ok: true, jams: raw.length, archiveJams: allRaw.length };
+    var arch = ss.getSheetByName(BASELINE_ARCHIVE);
+    var archiveCells = arch && arch.getLastRow() > 1 ? arch.getLastRow() - 1 : 0;
+    return { ok: true, jams: raw.length, archiveJams: archiveCells };
   } catch(e) {
     return { ok: false, error: e.message };
   }
