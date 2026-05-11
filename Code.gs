@@ -8,6 +8,7 @@
 var RAW_SHEET    = 'raw_data';
 var SOURCES_SHEET = 'מקור';
 var FILTER_SHEET  = '_filter';   // hidden, stores last applied filter
+var BASELINE_ARCHIVE = '_baseline_archive';   // hidden, permanent aggregated counters
 var RETENTION_DAYS = 30;
 
 // Resumable archive job: bounded work per execution, resumed via time trigger.
@@ -22,8 +23,69 @@ function onOpen() {
     .addItem('פתח סרגל צד...', 'showSidebar')
     .addSeparator()
     .addItem('💾 ייצא ארכיון מלא ל-Drive', 'menuExportArchive')
+    .addItem('▶️ המשך ייצוא תקוע', 'menuResumeArchiveJob')
+    .addItem('🛑 בטל ייצוא תקוע', 'menuCancelArchiveJob')
+    .addItem('🔄 העבר נתונים קיימים לארכיון אגרגטיבי', 'menuMigrateToArchive')
     .addItem('מחק את כל הנתונים', 'clearAllData')
     .addToUi();
+}
+
+// Manually run the next slice of a stuck archive job. Use when the auto-trigger
+// failed to fire (trigger quota exhausted, silent failure, etc.).
+function menuResumeArchiveJob() {
+  var ui = SpreadsheetApp.getUi();
+  var job = _getArchiveJob();
+  if (!job) {
+    ui.alert('אין ייצוא פעיל', 'לא נמצא ג\'וב ייצוא פעיל לחידוש.', ui.ButtonSet.OK);
+    return;
+  }
+  // Clean up any orphaned continuation triggers before running
+  _deleteArchiveContinuationTriggers();
+  try {
+    var r = _runArchiveSlice();
+    if (r && r.done) {
+      ui.alert('הצלחה',
+        'הייצוא הושלם!\n\nשם קובץ: ' + r.filename + '\nמספר פקקים: ' + r.count + '\n\nקישור: ' + r.url,
+        ui.ButtonSet.OK);
+    } else {
+      var prog = (r && r.progress) ? r.progress : { processed: '?', total: '?' };
+      ui.alert('המשך ריצה',
+        'בוצע סלייס נוסף.\n\nהתקדמות: ' + prog.processed + ' מתוך ' + prog.total + '\n\n' +
+        'אם הריצה עוצרת שוב, פתח שוב את התפריט וסמן "▶️ המשך ייצוא תקוע".',
+        ui.ButtonSet.OK);
+    }
+  } catch(e) {
+    ui.alert('שגיאה', 'הריצה נכשלה: ' + e.message + '\n\nאפשר לנסות שוב, או לבטל את הג\'וב.', ui.ButtonSet.OK);
+  }
+}
+
+// Abort a stuck archive job — clears state and removes triggers. Partial CSV files in Drive remain.
+function menuCancelArchiveJob() {
+  var ui = SpreadsheetApp.getUi();
+  var job = _getArchiveJob();
+  if (!job) {
+    ui.alert('אין ייצוא פעיל', 'לא נמצא ג\'וב ייצוא פעיל לביטול.', ui.ButtonSet.OK);
+    return;
+  }
+  var resp = ui.alert('ביטול ייצוא',
+    'לבטל את הג\'וב? נכון לעכשיו: ' + (job.nextRow - 1) + ' מתוך ' + job.totalRows + ' שורות עובדו.\n\n' +
+    'ה-' + job.partFileIds.length + ' קבצי CSV החלקיים יישארו ב-Drive (תיקיית Waze Archive) — תוכל למחוק ידנית.\n\n' +
+    'במקרה של prune-job, raw_data לא יימחק.',
+    ui.ButtonSet.YES_NO);
+  if (resp !== ui.Button.YES) return;
+  _clearArchiveJob();
+  _deleteArchiveContinuationTriggers();
+  ui.alert('בוטל', 'הג\'וב בוטל. אפשר להתחיל ייצוא חדש מהתפריט.', ui.ButtonSet.OK);
+}
+
+function menuMigrateToArchive() {
+  var ui = SpreadsheetApp.getUi();
+  var r = migrateToBaselineArchive();
+  if (!r.ok) { ui.alert('שגיאה', r.error, ui.ButtonSet.OK); return; }
+  ui.alert('הצלחה',
+    'הועברו ' + r.processed + ' שורות מ-raw_data לארכיון אגרגטיבי קבוע.\n\n' +
+    'הארכיון נמצא בלשונית מוסתרת _baseline_archive ומשמש לחישוב baseline היסטוריים.',
+    ui.ButtonSet.OK);
 }
 
 function menuExportArchive() {
@@ -106,10 +168,15 @@ function applyFilter(filter) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   _saveFilter(ss, filter);
   try {
+    // Remove legacy/renamed sheets that the current version no longer produces
+    ['פירוט לפי מרווח זמן', 'מקרא'].forEach(function(legacyName) {
+      var legacy = ss.getSheetByName(legacyName);
+      if (legacy) ss.deleteSheet(legacy);
+    });
+
     var raw = _readFiltered(ss, filter);
     if (!raw.length) return { ok: false, error: 'אין נתונים בטווח שנבחר' };
-    var allRaw = _readFiltered(ss, null);          // baselines use FULL archive
-    var baselines = _computeBaselines(allRaw);
+    var baselines = _computeBaselines(ss);          // reads from permanent _baseline_archive
     _sheet0_dashboard(ss, raw, filter, baselines);
     _sheet1_summary(ss, raw, filter, baselines);
     _sheet2_timebins(ss, raw, baselines);
@@ -118,41 +185,67 @@ function applyFilter(filter) {
     _sheet5_detail(ss, raw);
     _sheet6_legend(ss);
     ss.getSheetByName('🎯 לוח מחוונים').activate();
-    return { ok: true, jams: raw.length, archiveJams: allRaw.length };
+    var arch = ss.getSheetByName(BASELINE_ARCHIVE);
+    var archiveCells = arch && arch.getLastRow() > 1 ? arch.getLastRow() - 1 : 0;
+    return { ok: true, jams: raw.length, archiveJams: archiveCells };
   } catch(e) {
     return { ok: false, error: e.message };
   }
 }
 
-// Build baselines from full archive: per route × dir, and per route × dir × tbin
-function _computeBaselines(allRaw) {
-  var byRD = {};      // route::dir → { n, sumDelay }
-  var byRDT = {};     // route::dir::tbin → { n, sumDelay }
-  ROUTES.forEach(function(route) {
-    [{ ix:1, streets:route.streets_dir1 },
-     { ix:2, streets:route.streets_dir2 }].forEach(function(d) {
-      if (!d.streets.length) return;
-      var jl = _getJamsForStreets(allRaw, d.streets);
-      var k = route.name + '::' + d.ix;
-      byRD[k] = { n: jl.length, sumDelay: _sum(jl, 'delay_s') };
-      jl.forEach(function(j) {
-        var tk = k + '::' + j.tbin;
-        var b = byRDT[tk] = byRDT[tk] || { n: 0, sumDelay: 0 };
-        b.n++; b.sumDelay += j.delay_s || 0;
-      });
+// Build baselines from the PERMANENT archive (_baseline_archive sheet).
+// Keys by route × dir × hour × daytype. Falls back to ±1, ±2 neighbor hours if exact cell is sparse.
+// Min sample size for a cell to be usable: n >= 3.
+function _computeBaselines(ss) {
+  var s = ss.getSheetByName(BASELINE_ARCHIVE);
+  var byRDH = {};   // route::dir::hour::daytype → { n, sumDelay }
+  var byRD  = {};   // route::dir → { n, sumDelay } (all hours combined — for summary view)
+
+  if (s && s.getLastRow() > 1) {
+    var rows = s.getRange(2, 1, s.getLastRow() - 1, BASELINE_COLS.length).getValues();
+    rows.forEach(function(r) {
+      var route = r[0], dir = r[1], date = r[2], hour = r[3];
+      var n = +r[4] || 0, sumDelay = +r[5] || 0;
+      if (!route || dir === '' || hour === '' || !n) return;
+      var dt = _dayTypeFromDate(date);
+      var k = route + '::' + dir + '::' + hour + '::' + dt;
+      var b = byRDH[k] = byRDH[k] || { n: 0, sumDelay: 0 };
+      b.n += n; b.sumDelay += sumDelay;
+      var k2 = route + '::' + dir;
+      var b2 = byRD[k2] = byRD[k2] || { n: 0, sumDelay: 0 };
+      b2.n += n; b2.sumDelay += sumDelay;
     });
-  });
+  }
+
+  function lookupExact(routeName, dirIx, hour, daytype) {
+    var b = byRDH[routeName + '::' + dirIx + '::' + hour + '::' + daytype];
+    return (b && b.n >= 3) ? { avg: b.sumDelay / b.n, n: b.n } : null;
+  }
+
   return {
-    // Avg delay per jam, route × dir, in seconds. null if no archive samples
+    // Returns { avg, n, source } or null if even ±2 doesn't yield n>=3.
+    avgPerJamAtHour: function(routeName, dirIx, hour, daytype) {
+      var exact = lookupExact(routeName, dirIx, hour, daytype);
+      if (exact) return { avg: exact.avg, n: exact.n, source: 'שעה זו' };
+      for (var w = 1; w <= 2; w++) {
+        var totN = 0, totSum = 0;
+        for (var dh = -w; dh <= w; dh++) {
+          var h = ((hour + dh) % 24 + 24) % 24;
+          var bb = byRDH[routeName + '::' + dirIx + '::' + h + '::' + daytype];
+          if (bb) { totN += bb.n; totSum += bb.sumDelay; }
+        }
+        if (totN >= 3) {
+          return { avg: totSum / totN, n: totN, source: '±'+w+' שעות' };
+        }
+      }
+      return null;
+    },
+    // Route × dir, all hours/daytypes combined — for "סיכום מסלולים" sheet only.
+    // Returns null if no archive data.
     avgPerJam: function(routeName, dirIx) {
       var b = byRD[routeName + '::' + dirIx];
-      return b && b.n > 0 ? b.sumDelay / b.n : null;
-    },
-    // Avg delay per jam, route × dir × tbin. Returns { avg, n } only if n>=3
-    avgPerJamForTbin: function(routeName, dirIx, tbin) {
-      var b = byRDT[routeName + '::' + dirIx + '::' + tbin];
-      return b && b.n >= 3 ? { avg: b.sumDelay / b.n, n: b.n } : null;
-    },
+      return (b && b.n >= 3) ? b.sumDelay / b.n : null;
+    }
   };
 }
 
@@ -347,7 +440,7 @@ function clearAllData() {
 
 var RAW_COLS = ['snapshot_ts','pub_ts','date','day','hour','tbin',
                 'street','city','level','length_m','delay_s','speed_kmh',
-                'start_node','end_node','tt_min'];
+                'start_node','end_node','tt_min','route_name','dir_ix','archived'];
 
 function _ensureRawSheet(ss) {
   var s = ss.getSheetByName(RAW_SHEET);
@@ -375,29 +468,184 @@ function _ensureSourcesSheet(ss) {
 function _appendToRawData(ss, jams, snapshotTs) {
   var s = _ensureRawSheet(ss);
   var days = ['שני','שלישי','רביעי','חמישי','שישי','שבת','ראשון'];
+  var jamObjsForArchive = [];
   var rows = jams.map(function(j) {
     var pm = j.pubMillis || snapshotTs.getTime();
     var dt = new Date(pm);
     var spd = j.speedKMH || 0;
     var ln  = j.length   || 0;
     var hour = dt.getHours();
+    var street = j.street || '';
+    var dateStr = Utilities.formatDate(dt, 'Asia/Jerusalem', 'yyyy-MM-dd');
+    var routeInfo = _routeForStreet(street);
+    var routeName = routeInfo ? routeInfo.routeName : '';
+    var dirIx = routeInfo ? routeInfo.dirIx : '';
+    var delay = j.delay || 0;
+    var level = j.level || 0;
+
+    if (routeInfo) {
+      jamObjsForArchive.push({
+        routeName: routeName, dirIx: dirIx,
+        date: dateStr, hour: hour,
+        delay_s: delay, speed: spd, level: level
+      });
+    }
+
     return [
       snapshotTs,                                       // snapshot_ts (Date)
       dt,                                                // pub_ts
-      Utilities.formatDate(dt, 'Asia/Jerusalem', 'yyyy-MM-dd'),
+      dateStr,
       days[dt.getDay() === 0 ? 6 : dt.getDay() - 1],
       hour,
       _tbin(hour),
-      j.street || '', j.city || '',
-      j.level || 0, ln,
-      j.delay || 0, spd,
+      street, j.city || '',
+      level, ln,
+      delay, spd,
       j.startNode || '', j.endNode || '',
       spd > 0 ? Math.round((ln / 1000) / spd * 60 * 100) / 100 : '',
+      routeName, dirIx,
+      true,                                              // archived = true (already aggregated)
     ];
   });
   if (rows.length) {
     s.getRange(s.getLastRow() + 1, 1, rows.length, RAW_COLS.length).setValues(rows);
   }
+  // Aggregate into permanent baseline archive (jams already marked archived=true above)
+  if (jamObjsForArchive.length) {
+    _upsertBaselineArchive(ss, jamObjsForArchive);
+  }
+}
+
+var BASELINE_COLS = ['route','dir','date','hour','n','sum_delay_s','sum_speed','sum_level','last_updated'];
+
+function _ensureBaselineArchive(ss) {
+  var s = ss.getSheetByName(BASELINE_ARCHIVE);
+  if (!s) {
+    s = ss.insertSheet(BASELINE_ARCHIVE);
+    try { s.hideSheet(); } catch(e) {}
+    s.getRange(1, 1, 1, BASELINE_COLS.length).setValues([BASELINE_COLS])
+     .setBackground('#1F3864').setFontColor('#fff').setFontWeight('bold');
+    s.setFrozenRows(1);
+  }
+  return s;
+}
+
+// Upsert aggregated counters from a list of jam-objects.
+// Each jam must have: routeName, dirIx, date, hour, delay_s, speed, level.
+// Caller is responsible for ensuring jams aren't double-counted (use archived flag).
+function _upsertBaselineArchive(ss, jamObjs) {
+  if (!jamObjs || !jamObjs.length) return 0;
+  var s = _ensureBaselineArchive(ss);
+  var n = s.getLastRow() - 1;
+  var existing = n > 0 ? s.getRange(2, 1, n, BASELINE_COLS.length).getValues() : [];
+
+  // index existing rows by composite key for O(1) lookup
+  var idx = {};
+  for (var i = 0; i < existing.length; i++) {
+    var r = existing[i];
+    idx[r[0] + '::' + r[1] + '::' + r[2] + '::' + r[3]] = i;
+  }
+
+  // bucket incoming jams
+  var buckets = {};
+  jamObjs.forEach(function(j) {
+    if (j.hour == null || !j.routeName) return;
+    var dateStr = j.date;
+    if (dateStr instanceof Date) {
+      dateStr = Utilities.formatDate(dateStr, 'Asia/Jerusalem', 'yyyy-MM-dd');
+    }
+    var k = j.routeName + '::' + j.dirIx + '::' + dateStr + '::' + j.hour;
+    var b = buckets[k] = buckets[k] || {
+      route: j.routeName, dir: j.dirIx, date: dateStr, hour: j.hour,
+      n: 0, sumDelay: 0, sumSpeed: 0, sumLevel: 0
+    };
+    b.n++;
+    b.sumDelay += (+j.delay_s) || 0;
+    b.sumSpeed += (+j.speed) || 0;
+    b.sumLevel += (+j.level) || 0;
+  });
+
+  var now = new Date();
+  var toAppend = [];
+  Object.keys(buckets).forEach(function(k) {
+    var b = buckets[k];
+    if (idx[k] !== undefined) {
+      var i = idx[k], r = existing[i];
+      r[4] = (+r[4] || 0) + b.n;
+      r[5] = (+r[5] || 0) + b.sumDelay;
+      r[6] = (+r[6] || 0) + b.sumSpeed;
+      r[7] = (+r[7] || 0) + b.sumLevel;
+      r[8] = now;
+      s.getRange(i + 2, 1, 1, BASELINE_COLS.length).setValues([r]);
+    } else {
+      toAppend.push([b.route, b.dir, b.date, b.hour, b.n, b.sumDelay, b.sumSpeed, b.sumLevel, now]);
+    }
+  });
+
+  if (toAppend.length) {
+    s.getRange(s.getLastRow() + 1, 1, toAppend.length, BASELINE_COLS.length).setValues(toAppend);
+  }
+  return Object.keys(buckets).length;
+}
+
+// Catch-up upsert: for rows in raw_data that aren't yet marked archived=true,
+// aggregate them into _baseline_archive and flip the flag. Idempotent (only touches unarchived rows).
+function _catchUpBaselineArchive(ss, raw, maxRows) {
+  if (!raw || raw.getLastRow() < 2) return 0;
+  var nRows = Math.min(maxRows || (raw.getLastRow() - 1), raw.getLastRow() - 1);
+  var values = raw.getRange(2, 1, nRows, RAW_COLS.length).getValues();
+  var jamObjs = [];
+  var rowsToFlag = [];
+
+  for (var i = 0; i < values.length; i++) {
+    var r = values[i];
+    var archivedFlag = r[17];
+    var isArchived = archivedFlag === true || archivedFlag === 'TRUE' || archivedFlag === 'true';
+    if (isArchived) continue;
+
+    var street = r[6];
+    var routeName = r[15];
+    var dirIx = r[16];
+    if (!routeName || dirIx === '' || dirIx === null) {
+      var info = _routeForStreet(street);
+      if (info) { routeName = info.routeName; dirIx = info.dirIx; }
+    }
+    if (!routeName) continue;
+
+    var dateStr = r[2];
+    if (dateStr instanceof Date) {
+      dateStr = Utilities.formatDate(dateStr, 'Asia/Jerusalem', 'yyyy-MM-dd');
+    }
+    jamObjs.push({
+      routeName: routeName, dirIx: dirIx,
+      date: dateStr, hour: r[4],
+      delay_s: r[10] || 0, speed: r[11] || 0, level: r[8] || 0
+    });
+    rowsToFlag.push({ sheetRow: i + 2, routeName: routeName, dirIx: dirIx });
+  }
+
+  if (!jamObjs.length) return 0;
+
+  _upsertBaselineArchive(ss, jamObjs);
+
+  // Flag rows as archived (and write back resolved route_name/dir_ix if missing)
+  rowsToFlag.forEach(function(rf) {
+    raw.getRange(rf.sheetRow, 16, 1, 3).setValues([[rf.routeName, rf.dirIx, true]]);
+  });
+  return jamObjs.length;
+}
+
+// One-time migration: walk existing raw_data and populate _baseline_archive.
+// Safe to re-run — only processes rows not yet marked archived.
+function migrateToBaselineArchive() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var raw = ss.getSheetByName(RAW_SHEET);
+  if (!raw || raw.getLastRow() < 2) {
+    return { ok: false, error: 'אין נתונים ב-raw_data' };
+  }
+  _ensureBaselineArchive(ss);
+  var count = _catchUpBaselineArchive(ss, raw);
+  return { ok: true, processed: count };
 }
 
 function _logSource(ss, snapshotTs, jamCount) {
@@ -431,6 +679,9 @@ function _pruneOld(ss) {
     else if (firstKeep === -1) pruneCount = nRows;
 
     if (pruneCount > 0) {
+      // Safety net: catch-up upsert any rows not yet aggregated to _baseline_archive.
+      // Normally _appendToRawData has already marked them archived=true, so this is a no-op.
+      _catchUpBaselineArchive(ss, raw, pruneCount);
       // Start a chunked archive job; deleteRows happens in _finalizeArchive after success.
       _startArchiveJob(ss, raw, pruneCount, 'prune');
     }
@@ -554,13 +805,27 @@ function exportFullArchive() {
 
 function getArchiveJobStatus() {
   var job = _getArchiveJob();
-  if (!job) return { active: false };
+  var lastError = '';
+  try { lastError = _archiveProps().getProperty('archiveJobLastError') || ''; } catch(_) {}
+  if (!job) return { active: false, lastError: lastError };
+
+  // Check whether a continuation trigger actually exists; if not, the auto-resume is broken.
+  var hasTrigger = false;
+  try {
+    hasTrigger = ScriptApp.getProjectTriggers().some(function(t) {
+      return t.getHandlerFunction() === ARCHIVE_TRIGGER_FN;
+    });
+  } catch(_) {}
+
   return {
     active: true,
     processed: job.nextRow - 1,
     total: job.totalRows,
     filename: job.filename,
     source: job.source,
+    parts: job.partFileIds ? job.partFileIds.length : 0,
+    hasTrigger: hasTrigger,
+    lastError: lastError,
   };
 }
 
@@ -592,6 +857,11 @@ function _continueArchiveJob() {
   try { _runArchiveSlice(); }
   catch(e) {
     Logger.log('Archive continuation failed: ' + e.message);
+    // Persist the error to the doc so the user can see it (Logger output isn't visible in spreadsheet UI).
+    try {
+      _archiveProps().setProperty('archiveJobLastError',
+        new Date().toISOString() + ' — ' + (e.message || String(e)));
+    } catch(_) {}
     // Reschedule once so a transient error gets a retry; user can also re-run manually.
     _scheduleArchiveContinuation();
   }
@@ -610,6 +880,13 @@ function _runArchiveSlice() {
   var startedAt = Date.now();
 
   while (job.nextRow <= job.totalRows) {
+    // Cooperative cancel check: if the job was cleared externally
+    // (menuCancelArchiveJob), abort without overwriting state.
+    var current = _getArchiveJob();
+    if (!current || current.filename !== job.filename) {
+      Logger.log('Archive slice aborted: job was cancelled externally');
+      return { ok: false, cancelled: true };
+    }
     if (Date.now() - startedAt > ARCHIVE_TIME_BUDGET_MS) {
       _setArchiveJob(job);
       _scheduleArchiveContinuation();
@@ -708,6 +985,8 @@ function _readFiltered(ss, filter) {
       street: r[6], city: r[7], level: r[8],
       length_m: r[9], delay_s: r[10], speed: r[11],
       sn: r[12], en: r[13], tt_min: r[14],
+      routeName: r[15] || '', dirIx: r[16] || '',
+      archived: r[17] === true || r[17] === 'TRUE' || r[17] === 'true',
     };
   });
 }
@@ -760,6 +1039,18 @@ function _newSheet(ss, name, tabColor) {
   s.setTabColor(tabColor);
   try { s.setRightToLeft(true); } catch(e) {}
   return s;
+}
+
+// Short explanatory intro at the top of a sheet — one row, merged across columns.
+function _tabIntro(sheet, ncols, text, row) {
+  row = row || 1;
+  sheet.getRange(row, 1, 1, ncols).merge()
+    .setValue('ℹ️ ' + text)
+    .setBackground('#E0F2FE').setFontColor('#075985')
+    .setFontSize(10).setFontStyle('italic')
+    .setHorizontalAlignment('right').setVerticalAlignment('middle')
+    .setWrap(true);
+  sheet.setRowHeight(row, 36);
 }
 
 function _hdrRow(sheet, cols, row) {
@@ -833,6 +1124,36 @@ function _tbin(h) { var b = Math.floor(h/4)*4; return _pad(b)+':00-'+_pad(b+4)+'
 function _pad(n) { return n < 10 ? '0'+n : ''+n; }
 function _round1(v) { return Math.round(v*10)/10; }
 
+// Day-of-week → 'weekday' | 'weekend'. Israeli convention: ו'+ש' are weekend.
+function _dayType(dayName) {
+  return (dayName === 'שישי' || dayName === 'שבת') ? 'weekend' : 'weekday';
+}
+function _dayTypeFromDate(dateStr) {
+  var d = new Date(dateStr).getDay();   // 0=Sun..6=Sat
+  return (d === 5 || d === 6) ? 'weekend' : 'weekday';
+}
+
+// Lookup table built lazily: street → { routeName, dirIx }.
+// Streets that appear in multiple routes will resolve to the FIRST match — should be rare.
+var _STREET_INDEX = null;
+function _buildStreetIndex() {
+  if (_STREET_INDEX) return _STREET_INDEX;
+  _STREET_INDEX = {};
+  for (var i = 0; i < ROUTES.length; i++) {
+    var r = ROUTES[i];
+    (r.streets_dir1 || []).forEach(function(s) {
+      if (!_STREET_INDEX[s]) _STREET_INDEX[s] = { routeName: r.name, dirIx: 1 };
+    });
+    (r.streets_dir2 || []).forEach(function(s) {
+      if (!_STREET_INDEX[s]) _STREET_INDEX[s] = { routeName: r.name, dirIx: 2 };
+    });
+  }
+  return _STREET_INDEX;
+}
+function _routeForStreet(street) {
+  return _buildStreetIndex()[street] || null;
+}
+
 // ═══ ANALYSIS SHEETS ══════════════════════════
 
 function _filterLabel(filter) {
@@ -857,21 +1178,50 @@ function _sheet0_dashboard(ss, jams, filter, baselines) {
       if (!d.label || !d.streets.length) return;
       var jl = _getJamsForStreets(jams, d.streets);
       if (!jl.length) return;
-      var curAvg = _sum(jl, 'delay_s') / jl.length;
-      var genBase = baselines && baselines.avgPerJam(route.name, d.ix);
+      // Aggregate deviation across all (hour, daytype) groups of this route×dir.
+      // Each group contributes a baseline lookup; we average the per-group deviations
+      // weighted by jam count, and tag the dominant source.
+      var groups = {};
+      jl.forEach(function(j) {
+        if (j.hour == null) return;
+        var dt = _dayType(j.day);
+        var k = j.hour + '::' + dt;
+        (groups[k] = groups[k] || { hour: j.hour, daytype: dt, jams: [] }).jams.push(j);
+      });
+
+      var weightedDev = 0, totalJamsWithBase = 0, sourceCounts = {};
+      Object.keys(groups).forEach(function(k) {
+        var g = groups[k];
+        var avg = _sum(g.jams, 'delay_s') / g.jams.length;
+        var base = baselines && baselines.avgPerJamAtHour(route.name, d.ix, g.hour, g.daytype);
+        if (base && base.avg > 0) {
+          var dv = (avg - base.avg) / base.avg * 100;
+          weightedDev += dv * g.jams.length;
+          totalJamsWithBase += g.jams.length;
+          sourceCounts[base.source] = (sourceCounts[base.source] || 0) + g.jams.length;
+        }
+      });
+
       var devPct, src, status;
-      if (genBase != null && genBase > 0) {
-        devPct = _round1((curAvg - genBase) / genBase * 100);
-        src = 'היסטורי';
+      if (totalJamsWithBase > 0) {
+        devPct = _round1(weightedDev / totalJamsWithBase);
+        // pick the dominant source label
+        var best = null, bestN = 0;
+        Object.keys(sourceCounts).forEach(function(s) {
+          if (sourceCounts[s] > bestN) { best = s; bestN = sourceCounts[s]; }
+        });
+        src = best || 'היסטורי';
+        status = devPct > 50 ? 'חריג מאוד'
+               : devPct > 25 ? 'עמוס'
+               : devPct > 10 ? 'מתון'
+               : devPct < -10 ? 'טוב מהרגיל'
+               : 'תקין';
       } else {
-        var totalMin = _sum(jl, 'delay_s') / 60;
-        devPct = route.free_flow_min > 0 ? _round1((totalMin / route.free_flow_min) * 100) : 0;
-        src = 'תיאורטי';
+        devPct = null;
+        src = 'אין נתונים';
+        status = 'אין מספיק נתונים';
       }
-      status = devPct > 50 ? 'חריג מאוד' :
-               devPct > 25 ? 'עמוס' :
-               devPct > 10 ? 'מתון' :
-               devPct < -10 ? 'טוב מהרגיל' : 'תקין';
+
       summary.push({
         section: route.section, route: route.name, dir: d.label,
         jams: jl.length, devPct: devPct, status: status, src: src,
@@ -897,16 +1247,24 @@ function _sheet0_dashboard(ss, jams, filter, baselines) {
     .setFontSize(11).setFontColor('#475569')
     .setBackground('#F1F5F9').setHorizontalAlignment('center');
 
+  ws.getRange(3, 1, 1, ncW).merge()
+    .setValue('ℹ️ סקירה כללית. KPIs סופרים מסלולים לפי סטטוס · "10 הגרועים" / "5 הטובים" ממוינים לפי % סטייה מההיסטוריה · "איכות הניתוח" אומר על איזה baseline נשענת ההשוואה (שעה זו = מדויק).')
+    .setBackground('#E0F2FE').setFontColor('#075985')
+    .setFontSize(10).setFontStyle('italic')
+    .setHorizontalAlignment('right').setVerticalAlignment('middle').setWrap(true);
+  ws.setRowHeight(3, 36);
+
   // ─── KPI strip (status counts) ───
-  var counts = { 'תקין':0,'מתון':0,'עמוס':0,'חריג מאוד':0,'טוב מהרגיל':0 };
-  summary.forEach(function(r) { counts[r.status]++; });
+  var counts = { 'תקין':0,'מתון':0,'עמוס':0,'חריג מאוד':0,'טוב מהרגיל':0,'אין מספיק נתונים':0 };
+  summary.forEach(function(r) { counts[r.status] = (counts[r.status] || 0) + 1; });
 
   var kpis = [
-    { label: '🟢 תקין',         count: counts['תקין'],        color: '#10B981' },
-    { label: '🟡 מתון',         count: counts['מתון'],        color: '#F59E0B' },
-    { label: '🟠 עמוס',         count: counts['עמוס'],        color: '#F97316' },
-    { label: '🔴 חריג מאוד',    count: counts['חריג מאוד'],   color: '#EF4444' },
-    { label: '🔵 טוב מהרגיל',   count: counts['טוב מהרגיל'],  color: '#3B82F6' },
+    { label: '🟢 תקין',         count: counts['תקין'],              color: '#10B981' },
+    { label: '🟡 מתון',         count: counts['מתון'],              color: '#F59E0B' },
+    { label: '🟠 עמוס',         count: counts['עמוס'],              color: '#F97316' },
+    { label: '🔴 חריג מאוד',    count: counts['חריג מאוד'],         color: '#EF4444' },
+    { label: '🔵 טוב מהרגיל',   count: counts['טוב מהרגיל'],        color: '#3B82F6' },
+    { label: '⚪ אין נתונים',    count: counts['אין מספיק נתונים'],  color: '#94A3B8' },
   ];
 
   for (var i = 0; i < kpis.length; i++) {
@@ -923,14 +1281,6 @@ function _sheet0_dashboard(ss, jams, filter, baselines) {
   ws.setRowHeight(4, 32);
   ws.setRowHeight(5, 64);
 
-  // Empty 6th column when fewer than 6 KPIs
-  if (kpis.length < ncW) {
-    for (var k = kpis.length + 1; k <= ncW; k++) {
-      ws.getRange(4, k).setBackground('#F1F5F9');
-      ws.getRange(5, k).setBackground('#F1F5F9');
-    }
-  }
-
   var row = 7;
 
   // ─── Top 10 worst routes ───
@@ -946,7 +1296,8 @@ function _sheet0_dashboard(ss, jams, filter, baselines) {
     .setFontWeight('bold').setHorizontalAlignment('center');
   row++;
 
-  var top10 = summary.slice().sort(function(a, b) { return b.devPct - a.devPct; }).slice(0, 10);
+  var withDev = summary.filter(function(r) { return r.devPct !== null; });
+  var top10 = withDev.slice().sort(function(a, b) { return b.devPct - a.devPct; }).slice(0, 10);
   top10.forEach(function(r, i) {
     var dev = (r.devPct >= 0 ? '+' : '') + r.devPct + '%';
     var rng = ws.getRange(row, 1, 1, ncW)
@@ -972,7 +1323,7 @@ function _sheet0_dashboard(ss, jams, filter, baselines) {
     .setFontWeight('bold').setHorizontalAlignment('center');
   row++;
 
-  var best5 = summary.slice().sort(function(a, b) { return a.devPct - b.devPct; }).slice(0, 5);
+  var best5 = withDev.slice().sort(function(a, b) { return a.devPct - b.devPct; }).slice(0, 5);
   best5.forEach(function(r, i) {
     var dev = (r.devPct >= 0 ? '+' : '') + r.devPct + '%';
     var rng = ws.getRange(row, 1, 1, ncW)
@@ -1001,7 +1352,9 @@ function _sheet0_dashboard(ss, jams, filter, baselines) {
 
   ['דרום','מרכז','צפון'].forEach(function(sec) {
     var c = { 'תקין':0,'מתון':0,'עמוס':0,'חריג מאוד':0,'טוב מהרגיל':0 };
-    summary.filter(function(r){ return r.section === sec; }).forEach(function(r) { c[r.status]++; });
+    summary.filter(function(r){ return r.section === sec; }).forEach(function(r) {
+      if (c[r.status] !== undefined) c[r.status]++;
+    });
     ws.getRange(row, 1, 1, ncW)
       .setValues([[sec, c['תקין'], c['מתון'], c['עמוס'], c['חריג מאוד'], c['טוב מהרגיל']]])
       .setFontSize(11).setHorizontalAlignment('center');
@@ -1016,12 +1369,17 @@ function _sheet0_dashboard(ss, jams, filter, baselines) {
   row++;
 
   // ─── Quality of analysis ───
-  var hist = summary.filter(function(r){ return r.src === 'היסטורי'; }).length;
-  var theo = summary.filter(function(r){ return r.src === 'תיאורטי'; }).length;
+  var srcExact  = summary.filter(function(r){ return r.src === 'שעה זו'; }).length;
+  var srcW1     = summary.filter(function(r){ return r.src === '±1 שעות'; }).length;
+  var srcW2     = summary.filter(function(r){ return r.src === '±2 שעות'; }).length;
+  var srcNone   = summary.filter(function(r){ return r.src === 'אין נתונים'; }).length;
   ws.getRange(row, 1, 1, ncW).merge()
-    .setValue('📊 איכות הניתוח: ' + hist + ' מסלולים מבוססים על היסטוריה  •  ' +
-              theo + ' מסלולים על בסיס תיאורטי' +
-              (theo > 0 ? '  ⚠️ העלה עוד דגימות לדיוק' : ''))
+    .setValue('📊 איכות הניתוח: ' +
+              srcExact + ' שעה זו  •  ' +
+              srcW1 + ' ±1 שעות  •  ' +
+              srcW2 + ' ±2 שעות  •  ' +
+              srcNone + ' אין נתונים' +
+              (srcNone > 0 ? '  ⚠️ העלה עוד דגימות' : ''))
     .setFontSize(10).setFontColor('#475569')
     .setBackground('#F8FAFC').setHorizontalAlignment('center')
     .setFontStyle('italic');
@@ -1050,6 +1408,8 @@ function _sheet1_summary(ss, jams, filter, baselines) {
     .setValue('מסנן: ' + _filterLabel(filter) + ' | פקקים: ' + jams.length)
     .setFontSize(10).setFontColor('#666').setHorizontalAlignment('center');
 
+  // intro row 3 will be written AFTER _autoWidth at the end of this function,
+  // so the merged intro text doesn't influence column auto-sizing.
   _hdrRow(ws, cols, 4);
 
   var row = 5, curSec = '';
@@ -1085,84 +1445,99 @@ function _sheet1_summary(ss, jams, filter, baselines) {
     if (dev2 && dev2.pct !== undefined) _colorDeviation(ws, row, 16, dev2.pct);
     row++;
   });
-  ws.setFrozenRows(4);
   _autoWidth(ws, nc);
+  _tabIntro(ws, nc, 'שורה לכל מסלול. שני הכיוונים מוצגים זה ליד זה. עמודות "סטייה כ1/כ2" משוות מול ממוצע היסטורי כללי של הכיוון (לא ספציפי לשעה — לרזולוציה לפי שעה ראה "פירוט לפי שעה").', 3);
+  ws.setFrozenRows(4);
 }
 
 function _sheet2_timebins(ss, jams, baselines) {
-  var ws = _newSheet(ss, 'פירוט לפי מרווח זמן', '#2E75B6');
-  var TIME_BINS = ['00:00-04:00','04:00-08:00','08:00-12:00','12:00-16:00','16:00-20:00','20:00-24:00'];
-  var cols = ['אזור','מסלול','כיוון','מרווח זמן','מס\' פקקים','אורך (ק"מ)',
-              'השהיה (דק\')','מהירות ממוצעת','רמת פקק ממוצעת',
-              'השהיה לפקק (דק\')','היסטורי באותה שעה','היסטורי כללי',
-              'סטייה משעה','סטייה מכללי','מקור השוואה','סטטוס'];
-  _hdrRow(ws, cols, 1);
+  var ws = _newSheet(ss, 'פירוט לפי שעה', '#2E75B6');
+  var cols = ['אזור','מסלול','כיוון','שעה','סוג יום',
+              'מס\' פקקים','אורך (ק"מ)','השהיה (דק\')','מהירות ממוצעת','רמת פקק ממוצעת',
+              'השהיה לפקק (דק\')','ממוצע היסטורי (דק\')','מקור השוואה','n',
+              'סטייה %','סטטוס'];
+  _hdrRow(ws, cols, 2);
 
-  var row = 2;
+  var row = 3;
   ROUTES.forEach(function(route) {
     [{label:route.dir1_label, streets:route.streets_dir1, ix:1},
      {label:route.dir2_label, streets:route.streets_dir2, ix:2}].forEach(function(dir) {
       if (!dir.label || !dir.streets.length) return;
       var jl = _getJamsForStreets(jams, dir.streets);
       if (!jl.length) return;
-      TIME_BINS.forEach(function(tb) {
-        var jj = jl.filter(function(j){return j.tbin === tb;});
-        if (!jj.length) return;
+
+      // Group by (hour, daytype). Most jams carry day name; daytype derives from day.
+      var groups = {};
+      jl.forEach(function(j) {
+        if (j.hour == null) return;
+        var dt = _dayType(j.day);
+        var k = j.hour + '::' + dt;
+        (groups[k] = groups[k] || { hour: j.hour, daytype: dt, jams: [] }).jams.push(j);
+      });
+
+      var keys = Object.keys(groups).sort(function(a, b) {
+        var ga = groups[a], gb = groups[b];
+        if (ga.daytype !== gb.daytype) return ga.daytype < gb.daytype ? -1 : 1;
+        return ga.hour - gb.hour;
+      });
+
+      keys.forEach(function(k) {
+        var g = groups[k];
+        var jj = g.jams;
         var tl = _round1(_sum(jj,'length_m')/1000);
         var td = _round1(_sum(jj.filter(function(j){return j.delay_s>0;}),'delay_s')/60);
         var spds = jj.filter(function(j){return j.speed>0;}).map(function(j){return j.speed;});
         var asp = spds.length ? _round1(_mean(spds)) : 0;
         var alv = _round1(_mean(jj.map(function(j){return j.level;})));
-
         var curAvg = jj.length ? _sum(jj, 'delay_s') / jj.length : 0;
-        var hourBase = baselines && baselines.avgPerJamForTbin(route.name, dir.ix, tb);
-        var genBase  = baselines && baselines.avgPerJam(route.name, dir.ix);
 
-        var hourAvgMin = hourBase ? _round1(hourBase.avg / 60) : '—';
-        var genAvgMin  = (genBase != null) ? _round1(genBase / 60) : '—';
-        var devHour = (hourBase && hourBase.avg > 0)
-          ? _round1((curAvg - hourBase.avg) / hourBase.avg * 100) : null;
-        var devGen  = (genBase != null && genBase > 0)
-          ? _round1((curAvg - genBase) / genBase * 100) : null;
+        var base = baselines && baselines.avgPerJamAtHour(route.name, dir.ix, g.hour, g.daytype);
 
-        // Smart status: prefer hour-baseline; fallback to general; fallback to free-flow vs total delay
-        var st, source;
-        if (devHour !== null) {
-          st = devHour>50?'חריג מאוד':devHour>25?'עמוס':devHour>10?'מתון':'תקין';
-          source = 'שעה (n='+hourBase.n+')';
-        } else if (devGen !== null) {
-          st = devGen>50?'חריג מאוד':devGen>25?'עמוס':devGen>10?'מתון':'תקין';
-          source = 'כללי';
+        var histMin, source, n, dev, status;
+        if (base) {
+          histMin = _round1(base.avg / 60);
+          source = base.source;
+          n = base.n;
+          dev = base.avg > 0 ? _round1((curAvg - base.avg) / base.avg * 100) : 0;
+          status = dev > 50 ? 'חריג מאוד'
+                 : dev > 25 ? 'עמוס'
+                 : dev > 10 ? 'מתון'
+                 : dev < -10 ? 'טוב מהרגיל'
+                 : 'תקין';
         } else {
-          var pa = route.free_flow_min > 0 ? Math.round(td/route.free_flow_min*1000)/10 : 0;
-          st = pa>50?'חריג מאוד':pa>25?'עמוס':pa>10?'מתון':'תקין';
-          source = 'תיאורטי';
+          histMin = '—';
+          source = '—';
+          n = '—';
+          dev = null;
+          status = 'אין מספיק נתונים';
         }
 
-        _dataRow(ws, row, [route.section, route.name, dir.label, tb,
+        var hourLabel = _pad(g.hour) + ':00';
+        var dtLabel = g.daytype === 'weekend' ? 'סופ"ש' : 'חול';
+
+        _dataRow(ws, row, [route.section, route.name, dir.label, hourLabel, dtLabel,
                            jj.length, tl, td, asp, alv,
-                           _round1(curAvg/60), hourAvgMin, genAvgMin,
-                           devHour!==null?devHour+'%':'—',
-                           devGen!==null?devGen+'%':'—',
-                           source, st],
+                           _round1(curAvg/60), histMin, source, n,
+                           dev !== null ? (dev >= 0 ? '+' : '') + dev + '%' : '—',
+                           status],
                  row % 2 === 0);
-        if (devHour !== null) _colorDeviation(ws, row, 13, devHour);
-        if (devGen  !== null) _colorDeviation(ws, row, 14, devGen);
-        _colorStatus(ws, row, 16, st);
+        if (dev !== null) _colorDeviation(ws, row, 15, dev);
+        _colorStatus(ws, row, 16, status);
         row++;
       });
     });
   });
-  ws.setFrozenRows(1);
   _autoWidth(ws, cols.length);
+  _tabIntro(ws, cols.length, 'הלב של הניתוח. שורה לכל מסלול × כיוון × שעה × סוג יום (חול/סופ"ש). "סטייה %" אומרת אם המצב כעת גרוע (חיובי) או טוב (שלילי) ביחס להיסטוריה באותה שעה. "מקור השוואה": "שעה זו" = השוואה מדויקת; "±1/±2 שעות" = הורחב כי אין מספיק דגימות; "—" = אין מספיק היסטוריה.', 1);
+  ws.setFrozenRows(2);
 }
 
 function _sheet3_directions(ss, jams) {
   var ws = _newSheet(ss, 'השוואת כיוונים', '#ED7D31');
   var cols = ['אזור','מסלול','מרחק','זמן חופשי','כיוון 1','כיוון 2',
               'השהיה כ1','השהיה כ2','זמן כ1','זמן כ2','הפרש','כיוון עמוס','יחס'];
-  _hdrRow(ws, cols, 1);
-  var row = 2;
+  _hdrRow(ws, cols, 2);
+  var row = 3;
   ROUTES.forEach(function(route) {
     if (!route.dir2_label) return;
     var j1 = _getJamsForStreets(jams, route.streets_dir1);
@@ -1182,15 +1557,16 @@ function _sheet3_directions(ss, jams) {
     ws.getRange(row, bc).setBackground(C_RED_BG).setFontColor(C_RED_FG).setFontWeight('bold');
     row++;
   });
-  ws.setFrozenRows(1);
   _autoWidth(ws, cols.length);
+  _tabIntro(ws, cols.length, 'השוואת שני כיוונים זה מול זה — רק מסלולים דו-כיווניים. "כיוון עמוס" מסומן באדום; "יחס" מציג כמה פעמים אחד עמוס מהשני (1.5x = פי 1.5).', 1);
+  ws.setFrozenRows(2);
 }
 
 function _sheet4_anomalies(ss, jams) {
   var ws = _newSheet(ss, 'חריגות', '#C00000');
   var cols = ['#','אזור','מסלול','כיוון','קטע','עיר','תאריך','יום','שעה','מרווח',
               'מהירות','אורך (מ\')','השהיה (דק\')','ממוצע (דק\')','חריגה %','רמת פקק','חומרה'];
-  _hdrRow(ws, cols, 1);
+  _hdrRow(ws, cols, 2);
   var anoms = [];
   ROUTES.forEach(function(route) {
     [{label:route.dir1_label,streets:route.streets_dir1},
@@ -1220,24 +1596,25 @@ function _sheet4_anomalies(ss, jams) {
     var sv = {קריטי:3,גבוה:2,בינוני:1};
     return (sv[b.sv]||0) - (sv[a.sv]||0) || b.dm - a.dm;
   });
-  var row = 2;
+  var row = 3;
   anoms.forEach(function(a, i) {
     _dataRow(ws, row, [i+1, a.sec, a.rt, a.dir, a.seg, a.city, a.date, a.day, a.hour, a.tb,
                        a.spd, a.ln, a.dm, a.am, a.dp+'%', a.lv, a.sv],
-             row % 2 === 0);
+             row % 2 === 1);
     _colorStatus(ws, row, 17, a.sv==='קריטי'?'חריג מאוד':a.sv==='גבוה'?'עמוס':'מתון');
     row++;
   });
-  ws.setFrozenRows(1);
   _autoWidth(ws, cols.length);
+  _tabIntro(ws, cols.length, 'פקקים בודדים שבולטים מאוד בתוך הפילטר הנוכחי. הקריטריון מקומי (1.5σ מעל הממוצע, או speed<5, או level≥4) — לא היסטורי. ממוין לפי חומרה ואז גודל ההשהיה.', 1);
+  ws.setFrozenRows(2);
 }
 
 function _sheet5_detail(ss, jams) {
   var ws = _newSheet(ss, 'פירוט פקקים', '#548235');
   var cols = ['#','אזור','מסלול','כיוון','קטע','עיר','תאריך','יום','שעה','מרווח',
               'מהירות','אורך (מ\')','השהיה (שנ\')','זמן נסיעה (דק\')','רמת פקק'];
-  _hdrRow(ws, cols, 1);
-  var row = 2, idx = 1;
+  _hdrRow(ws, cols, 2);
+  var row = 3, idx = 1;
   ROUTES.forEach(function(route) {
     [{label:route.dir1_label,streets:route.streets_dir1},
      {label:route.dir2_label,streets:route.streets_dir2}].forEach(function(dir) {
@@ -1249,88 +1626,258 @@ function _sheet5_detail(ss, jams) {
                            j.sn+' → '+j.en, j.city, j.date, j.day,
                            j.hour!==null?_pad(j.hour)+':00':'', j.tbin,
                            j.speed, j.length_m, j.delay_s, j.tt_min, j.level],
-                 row % 2 === 0);
+                 row % 2 === 1);
         row++;
       });
     });
   });
-  ws.setFrozenRows(1);
   _autoWidth(ws, cols.length);
+  _tabIntro(ws, cols.length, 'יומן מלא של כל הפקקים בפילטר הנוכחי — שורה לכל פקק יחיד. ממוין לפי מסלול → כיוון → זמן. שימושי לחפירה לעומק.', 1);
+  ws.setFrozenRows(2);
 }
 
 function _sheet6_legend(ss) {
-  var ws = _newSheet(ss, 'מקרא', '#666666');
-  var legend = [
-    ['שדה','הסבר'],
-    ['זמן חופשי','זמן נסיעה תיאורטי ללא עומסים (קבוע, לא תלוי שעה)'],
-    ['השהיה מצטברת','סך ההשהיות מכלל הפקקים במסלול בטווח שנבחר'],
-    ['השהיה לפקק','השהיה ממוצעת לפקק יחיד בטווח הנבחר (דקות)'],
-    ['היסטורי באותה שעה','ממוצע השהיה לפקק עבור אותו מסלול × כיוון × מרווח שעות, מכל הארכיון'],
-    ['היסטורי כללי','ממוצע השהיה לפקק עבור אותו מסלול × כיוון בכל שעות היום, מכל הארכיון'],
-    ['סטייה משעה','(נוכחי − היסטורי שעה) ÷ היסטורי שעה × 100. נדרשות לפחות 3 דגימות לאותה שעה'],
-    ['סטייה מכללי','(נוכחי − היסטורי כללי) ÷ היסטורי כללי × 100. עובד גם עם דגימה אחת בארכיון'],
-    ['מקור השוואה','שעה — היה מספיק היסטוריה. כללי — fallback. תיאורטי — אין היסטוריה כלל'],
-    ['רמת פקק','1=זרימה, 2=מתון, 3=בינוני, 4=כבד, 5=עצירה'],
-    ['',''],
-    ['סטטוס','קריטריונים (לפי מקור ההשוואה הזמין)'],
-    ['תקין','סטייה עד 10%'],
-    ['מתון','10%–25%'],
-    ['עמוס','25%–50%'],
-    ['חריג מאוד','מעל 50%'],
-    ['',''],
-    ['קוד צבעים בעמודות סטייה',''],
-    ['ירוק','בין 10%- ל-+10% (תקין)'],
-    ['צהוב','+10% עד +25%'],
-    ['כתום','+25% עד +50%'],
-    ['אדום','מעל +50%'],
-    ['כחול','מתחת ל-10%- (פחות עומס מהרגיל)'],
+  var ws = _newSheet(ss, 'מקרא ומתודולוגיה', '#666666');
+  // Position as the first tab — entry point for users
+  try { ss.setActiveSheet(ws); ss.moveActiveSheet(1); } catch(e) {}
+
+  var SEC = 'section', HDR = 'header', ROW = 'row', BLANK = 'blank';
+  var items = [
+    { type: SEC, text: '§1. מדריך לשוניות — מה רואים בכל גיליון' },
+    { type: HDR, a: 'לשונית', b: 'מה היא מציגה ואיך לקרוא אותה' },
+
+    { type: ROW, a: '🎯 לוח מחוונים',
+      b: 'תצוגה אחת על דף — סיכום מהיר של מצב התנועה. בראש: שש כרטיסיות KPI שסופרות כמה מסלולים-כיוונים נמצאים בכל סטטוס (תקין/מתון/עמוס/חריג מאוד/טוב מהרגיל/אין נתונים). אחרי זה: 10 המסלולים הגרועים ביותר (לפי % סטייה מההיסטוריה), 5 המסלולים הטובים, ופילוח לפי אזור (דרום/מרכז/צפון). בתחתית: שורת איכות הניתוח שאומרת כמה מסלולים נשענים על baseline מדויק vs. הרחבת חלון. הלשונית הזו טובה ל"מה קורה עכשיו" — ולא לחפירה לעומק.' },
+
+    { type: ROW, a: 'סיכום מסלולים',
+      b: 'שורה לכל מסלול (כביש 1, כביש 6 וכו\'), מקובץ לפי אזור. כל שורה מציגה את שני הכיוונים זה ליד זה — כמה פקקים בכל כיוון, סך השהיה בדקות, וזמן נסיעה משוער (זמן חופשי + השהיה). שתי העמודות האחרונות הן "סטייה כ1/כ2 vs ממוצע כללי" — איך שתי המספרים האלה משווים את כל הפקקים בכיוון לממוצע ההיסטורי הכללי של אותו כיוון (מכל השעות). זה תצוגה גסה — לרזולוציה אמיתית של "האם זה גרוע מהרגיל באותה שעה" לך ללשונית הבאה.' },
+
+    { type: ROW, a: 'פירוט לפי שעה',
+      b: 'הלב של הניתוח. שורה לכל שילוב של (מסלול × כיוון × שעה × סוג יום). מציגה: כמה פקקים בשעה הזו, ההשהיה הממוצעת לפקק כעת, ההשהיה הממוצעת ההיסטורית באותה שעה, ועמודת "סטייה %" — האם המצב כעת גרוע (חיובי) או טוב (שלילי) ביחס להיסטוריה. עמודת "מקור השוואה" אומרת איזה חלון שימש: "שעה זו" = השוואה מדויקת; "±1 שעות" / "±2 שעות" = הורחבנו לחלון כי אין מספיק דגימות; "—" = אין מספיק היסטוריה בכלל. עמודת n = כמה פקקים היסטוריים השתתפו ב-baseline.' },
+
+    { type: ROW, a: 'השוואת כיוונים',
+      b: 'רק מסלולים דו-כיווניים. מציגה שני כיוונים זה מול זה: השהיה כ1 vs כ2, זמן משוער כ1 vs כ2, ההפרש ביניהם, הכיוון העמוס יותר (מסומן באדום), ויחס (1.5x = כיוון אחד פי 1.5 מהשני). מועיל לתשובה: "אם אני יוצא עכשיו, באיזה כיוון יהיה פקק יותר גדול?"' },
+
+    { type: ROW, a: 'חריגות',
+      b: 'רשימת פקקים בודדים שבולטים מאוד מהאחרים. הקריטריון אינו השוואה היסטורית אלא סטטיסטיקה מקומית: ההשהיה גבוהה ב-1.5 סטיות תקן מעל הממוצע של אותו מסלול×כיוון בפילטר הנוכחי, או שהמהירות נמוכה מ-5 קמ"ש, או שרמת הפקק היא 4-5 (כבד/עצירה). ממוין לפי חומרה (קריטי → גבוה → בינוני) ואז לפי גודל ההשהיה. שימושי לזהות "מה הפקק הכי חריג בשבוע האחרון?" — בלי קשר אם זה דפוס רגיל לכביש הזה או לא.' },
+
+    { type: ROW, a: 'פירוט פקקים',
+      b: 'יומן גולמי — שורה לכל פקק יחיד בפילטר הנוכחי. רואים בדיוק איזה קטע (start → end), עיר, תאריך, שעה, מהירות, אורך הפקק במטרים, השהיה בשניות, וזמן נסיעה. ממוין לפי מסלול × כיוון × זמן. שימושי לחפירה — "מה בדיוק קרה ביום שלישי ב-08:00?"' },
+
+    { type: ROW, a: 'אגרגציה לאורך זמן',
+      b: 'תצוגה ישירה של הארכיון הקבוע (_baseline_archive) — כל ההיסטוריה, לא רק 30 הימים האחרונים. שורה לכל (תאריך × מסלול × כיוון × שעה) עם מספר הפקקים שהיו וההשהיה/מהירות/רמה הממוצעת. ממוין מהחדש לישן. שימושי למגמות לאורך זמן: "האם התנועה בכביש 1 ב-17:00 גרועה יותר בחורף או בקיץ?", "האם נובמבר 2026 גרוע מנובמבר 2025?". מוגבל ל-5000 שורות אחרונות בתצוגה (אם הארכיון גדול מזה — סנן ב-Sheets פילטר).' },
+
+    { type: ROW, a: 'מקרא ומתודולוגיה',
+      b: 'הלשונית הזו. הסבר על השדות, איך מחושב הניתוח, מה משמעות כל סטטוס וצבע, ומה המגבלות.' },
+
+    { type: BLANK },
+    { type: SEC, text: '§2. שדות הנתונים' },
+    { type: HDR, a: 'שדה', b: 'הסבר' },
+    { type: ROW, a: 'זמן חופשי (free_flow_min)', b: 'זמן נסיעה תיאורטי ללא עומסים (קבוע ידני לכל מסלול). משמש לעמודת ייחוס בלבד, לא לחישוב סטייה.' },
+    { type: ROW, a: 'השהיה (delay_s)', b: 'כמה שניות נוספו לזמן הנסיעה בגלל הפקק (לפי Waze).' },
+    { type: ROW, a: 'השהיה לפקק', b: 'ממוצע ה-delay_s לפקק בודד בטווח הנוכחי (דקות).' },
+    { type: ROW, a: 'רמת פקק (level)', b: '1=זרימה · 2=מתון · 3=בינוני · 4=כבד · 5=עצירה.' },
+    { type: ROW, a: 'מהירות (speed_kmh)', b: 'מהירות נסיעה ממוצעת באזור הפקק.' },
+    { type: ROW, a: 'tbin', b: 'רצועת 4 שעות (לתאימות לאחור). הניתוח החדש משתמש בשעה בודדת.' },
+    { type: ROW, a: 'route_name + dir_ix', b: 'שיוך הפקק למסלול מוגדר ולכיוון (1 או 2). מחושב בעת ה-upload.' },
+    { type: ROW, a: 'archived', b: 'דגל: האם הפקק כבר נספר ל-_baseline_archive (מונע ספירה כפולה).' },
+
+    { type: BLANK },
+    { type: SEC, text: '§3. ארכיטקטורת הנתונים — סוגי לשוניות' },
+    { type: HDR, a: 'לשונית', b: 'מתי מתעדכנת ומה היא צוברת' },
+
+    { type: ROW, a: '🔄 7 לשוניות הניתוח',
+      b: 'לוח מחוונים · סיכום מסלולים · פירוט לפי שעה · השוואת כיוונים · חריגות · פירוט פקקים · מקרא ומתודולוגיה — **נמחקות ונבנות מחדש בכל "החל סינון"**. הפילטר חל על raw_data, אבל ההשוואות מול _baseline_archive (כל ההיסטוריה).' },
+
+    { type: ROW, a: '🔁 אגרגציה לאורך זמן',
+      b: 'נבנית מחדש **רק בעת upload חדש**, לא בעת סינון. תצוגה של _baseline_archive ממוין מהחדש לישן.' },
+
+    { type: ROW, a: '📥 raw_data',
+      b: 'גלוי. שורה לכל פקק בכל snapshot — מקור גרעיני. עמודות: snapshot_ts, pub_ts, date, day, hour, tbin, street, city, level, length_m, delay_s, speed_kmh, start_node, end_node, tt_min, route_name, dir_ix, archived. **נשמר 30 יום ואז עובר prune אוטומטי** (השורות הישנות מיוצאות ל-Drive כ-CSV לפני המחיקה).' },
+
+    { type: ROW, a: '💎 _baseline_archive',
+      b: 'מוסתר. **לעולם לא נמחק** — מקור האמת לכל baseline היסטורי. רשומה מצטברת פר (route, dir, date, hour) עם n, sum_delay_s, sum_speed, sum_level, last_updated. מתעדכן upsert בכל upload חדש. גם אחרי שה-raw_data של פקק מסוים נמחק, המונה שלו ממשיך להשפיע על ה-baseline.' },
+
+    { type: ROW, a: '📋 מקור',
+      b: 'גלוי. יומן הופעות snapshot — חותמת זמן, תאריך, שעה, מספר פקקים בכל upload. משמש לזיהוי כפילויות (אם startTime זהה כבר קיים, ה-upload נדחה). נשמר 30 יום.' },
+
+    { type: ROW, a: '📁 ארכיון נפרד',
+      b: 'גלוי. יומן של הייצואים ל-Drive (שם קובץ, טווח תאריכים, קישור). מתעדכן בכל ייצוא של 30 הימים שעוברים prune או ייצוא ידני.' },
+
+    { type: ROW, a: '🔒 _config (מוסתר)',
+      b: 'תצורת auto-fetch: fetch_url, fetch_headers, fetch_interval, trigger_owner. נשמר ברמת הגיליון כדי לשרוד החלפת מחשבים/חשבונות.' },
+
+    { type: ROW, a: '🔒 _fetch_log (מוסתר)',
+      b: 'יומן ריצות של ה-auto-fetch — חותמת זמן, משתמש, סטטוס (הצלחה/כפילות/שגיאה), מספר פקקים, הודעת שגיאה. שימושי לדיבאג של ה-cron.' },
+
+    { type: ROW, a: '🔒 _filter (מוסתר)',
+      b: 'הפילטר האחרון שהוחל (JSON blob: fromDate, toDate, fromHour, toHour, days). נדרס בכל "החל סינון".' },
+
+    { type: ROW, a: 'עיקרון מפתח',
+      b: 'הסינון מסנן את raw_data בלבד. ה-baseline-ים תמיד מגיעים מ-_baseline_archive המלא, ללא קשר לפילטר. כך "מה שאתה רואה בטווח שבחרת" מושווה תמיד מול "כל מה שהמערכת יודעת מההיסטוריה".' },
+
+    { type: BLANK },
+    { type: SEC, text: '§4. איך מחושב baseline היסטורי' },
+    { type: ROW, a: 'מפתח', b: 'מסלול × כיוון × שעה × סוג-יום (חול=א\'–ה\' · סופ"ש=ו\'–ש\').' },
+    { type: ROW, a: 'מקור', b: 'סכימה מצטברת מתוך _baseline_archive (כל ההיסטוריה, לא רק 30 יום).' },
+    { type: ROW, a: 'מינימום דגימות', b: 'n ≥ 3 לתא. תאים עם פחות נחשבים "ריקים".' },
+
+    { type: BLANK },
+    { type: SEC, text: '§5. מקור ההשוואה (Fallback)' },
+    { type: ROW, a: '"שעה זו"', b: 'יש n ≥ 3 בתא המדויק (אותה שעה ואותו סוג יום). השוואה מדויקת.' },
+    { type: ROW, a: '"±1 שעות"', b: 'התא המדויק רֵיק. הורחב לחלון של 3 שעות סביב (H−1, H, H+1) באותו סוג יום.' },
+    { type: ROW, a: '"±2 שעות"', b: 'גם ±1 לא הספיק. הורחב לחלון של 5 שעות (H−2..H+2).' },
+    { type: ROW, a: '"אין מספיק נתונים"', b: 'אפילו ±2 לא נתן 3 דגימות. אין השוואה, אין סטטוס. (במקום fallback כללי שהיה יוצר false positives.)' },
+    { type: ROW, a: 'הימנעות מהצלבה', b: 'ימי חול לעולם לא משווים מול דגימות סופ"ש, גם בהרחבה.' },
+
+    { type: BLANK },
+    { type: SEC, text: '§6. חישוב הסטייה' },
+    { type: ROW, a: 'נוסחה', b: 'סטייה% = (ממוצע_נוכחי − ממוצע_היסטורי) ÷ ממוצע_היסטורי × 100' },
+    { type: ROW, a: 'יחידות', b: 'הממוצע מחושב בשניות (delay_s) לפקק בודד. ההמרה לדקות נעשית רק לתצוגה.' },
+    { type: ROW, a: 'משמעות', b: '+30% = הפקקים גרועים ב-30% מהמצב הרגיל באותה שעה. −15% = טובים ב-15%.' },
+
+    { type: BLANK },
+    { type: SEC, text: '§7. ספי סטטוס' },
+    { type: ROW, a: '🟢 תקין', b: '|סטייה| ≤ 10%' },
+    { type: ROW, a: '🟡 מתון', b: 'סטייה +10% עד +25%' },
+    { type: ROW, a: '🟠 עמוס', b: 'סטייה +25% עד +50%' },
+    { type: ROW, a: '🔴 חריג מאוד', b: 'סטייה > +50%' },
+    { type: ROW, a: '🔵 טוב מהרגיל', b: 'סטייה < −10%' },
+    { type: ROW, a: '⚪ אין מספיק נתונים', b: 'אין baseline היסטורי לתא — לא ניתן לקבוע סטטוס.' },
+
+    { type: BLANK },
+    { type: SEC, text: '§8. זיהוי חריגות (לשונית "חריגות")' },
+    { type: ROW, a: 'שיטה', b: 'שונה מ-baseline היסטורי: סטטיסטיקה מקומית **בתוך** הפילטר הנוכחי.' },
+    { type: ROW, a: 'קריטריון', b: 'פקק נחשב חריג אם: delay > mean + 1.5σ (לאותו מסלול×כיוון), או speed < 5, או level ≥ 4.' },
+    { type: ROW, a: 'חומרה', b: 'קריטי (speed<3 או סטייה>200%) · גבוה (level≥4 או סטייה>100%) · בינוני (השאר).' },
+    { type: ROW, a: 'למה שתי שיטות', b: 'ה-baseline שואל: "האם זה גרוע מהרגיל?". החריגות שואלות: "אילו פקקים בולטים מבין מה שראינו השבוע?". משלימות.' },
+
+    { type: BLANK },
+    { type: SEC, text: '§9. סולם צבעים בעמודות סטייה' },
+    { type: ROW, a: '🟢 ירוק', b: 'בין −10% ל-+10% (תקין)' },
+    { type: ROW, a: '🟡 צהוב', b: '+10% עד +25%' },
+    { type: ROW, a: '🟠 כתום', b: '+25% עד +50%' },
+    { type: ROW, a: '🔴 אדום', b: 'מעל +50%' },
+    { type: ROW, a: '🔵 כחול', b: 'מתחת ל-−10% (פחות עומס מהרגיל)' },
+
+    { type: BLANK },
+    { type: SEC, text: '§10. מגבלות המתודולוגיה' },
+    { type: ROW, a: 'חודש ראשון', b: 'רוב התאים יתפסו ב-±1 או ±2 שעות. ככל שהארכיון מתבגר, יותר תאים יקבלו "שעה זו". זה צפוי.' },
+    { type: ROW, a: 'חגים ואירועים', b: 'הארכיון לא מבחין בין יום רגיל ליום חג. דגימת חג הופכת לדגימה רגילה בסטטיסטיקה.' },
+    { type: ROW, a: 'משקלול לפי עדכניות', b: 'אין. דגימה מלפני שנה שווה בערכה לדגימה מהשבוע.' },
+    { type: ROW, a: 'free_flow_min', b: 'הערכה ידנית של זמן נסיעה ללא פקקים. משמש לעמודת ייחוס בלבד, לא לחישוב סטייה.' },
+
+    { type: BLANK },
+    { type: SEC, text: '§11. רענון הנתונים' },
+    { type: ROW, a: 'בכל upload', b: 'מתווסף ל-raw_data ו-upsert ל-_baseline_archive בו זמנית.' },
+    { type: ROW, a: 'pruning', b: 'raw_data מנקה אוטומטית שורות > 30 יום (אחרי שמייצאות ל-Drive כ-CSV). _baseline_archive תמיד נשמר.' },
+    { type: ROW, a: 'מיגרציה', b: 'תפריט "🚦 Waze → 🔄 העבר נתונים קיימים לארכיון" — קולט שורות ישנות שעדיין לא נספרו לארכיון.' },
+
+    { type: BLANK },
+    { type: SEC, text: '§12. מילון מונחים מקוצר' },
+    { type: ROW, a: 'daytype', b: 'סוג יום: weekday (חול) או weekend (סופ"ש).' },
+    { type: ROW, a: 'jam', b: 'פקק יחיד באירוע יחיד — שורה אחת ב-raw_data.' },
+    { type: ROW, a: 'snapshot', b: 'תמונת מצב אחת מ-Waze (עשרות-מאות פקקים).' },
+    { type: ROW, a: 'baseline', b: 'הממוצע ההיסטורי שנגדו משווים.' },
+    { type: ROW, a: 'upsert', b: 'update-or-insert: אם המפתח קיים — מצטבר ל-counters; אחרת — שורה חדשה.' },
+    { type: ROW, a: 'prune', b: 'מחיקת שורות ישנות מ-raw_data (אחרי 30 יום).' },
   ];
-  legend.forEach(function(r, i) {
-    var range = ws.getRange(i+1, 1, 1, 2);
-    range.setValues([r]);
-    if (i === 0) range.setBackground(C_HDR_BG).setFontColor(C_HDR_FG).setFontWeight('bold');
-    else ws.getRange(i+1, 1).setFontWeight('bold');
+
+  var SEC_BG = '#1F3864', SEC_FG = '#FFFFFF';
+  var HDR_BG = '#475569', HDR_FG = '#FFFFFF';
+  var ALT_BG = '#F8FAFC';
+
+  var r = 1;
+  items.forEach(function(item, i) {
+    if (item.type === SEC) {
+      ws.getRange(r, 1, 1, 2).merge().setValue(item.text)
+        .setBackground(SEC_BG).setFontColor(SEC_FG)
+        .setFontWeight('bold').setFontSize(13)
+        .setHorizontalAlignment('right').setVerticalAlignment('middle');
+      ws.setRowHeight(r, 30);
+    } else if (item.type === HDR) {
+      ws.getRange(r, 1, 1, 2).setValues([[item.a, item.b]])
+        .setBackground(HDR_BG).setFontColor(HDR_FG)
+        .setFontWeight('bold').setHorizontalAlignment('center');
+    } else if (item.type === ROW) {
+      var rng = ws.getRange(r, 1, 1, 2).setValues([[item.a, item.b]])
+        .setFontSize(11).setVerticalAlignment('top').setWrap(true);
+      ws.getRange(r, 1).setFontWeight('bold').setHorizontalAlignment('right');
+      ws.getRange(r, 2).setHorizontalAlignment('right');
+      if (i % 2 === 0) rng.setBackground(ALT_BG);
+    } else if (item.type === BLANK) {
+      ws.setRowHeight(r, 12);
+    }
+    r++;
   });
-  _autoWidth(ws, 2);
+
+  ws.setColumnWidth(1, 220);
+  ws.setColumnWidth(2, 520);
+  ws.setFrozenRows(0);
 }
 
-// ═══ AGGREGATION (always uses ALL raw data) ═══
+// ═══ AGGREGATION VIEW (reads from permanent _baseline_archive) ═══
+// Shows trends across the FULL history (not the 30-day raw_data window).
 function _rebuildAggregation(ss) {
-  var raw = _readFiltered(ss, null);
-  if (!raw.length) return;
+  var arch = ss.getSheetByName(BASELINE_ARCHIVE);
+  if (!arch || arch.getLastRow() < 2) return;
 
   var ws = _newSheet(ss, 'אגרגציה לאורך זמן', '#7030A0');
-  ws.getRange(1,1,1,8).merge()
-    .setValue('מגמות לאורך זמן (כל הנתונים בארכיון)')
+  var ncW = 9;
+  ws.getRange(1,1,1,ncW).merge()
+    .setValue('מגמות לאורך זמן — מבוסס על הארכיון הקבוע (כל ההיסטוריה)')
     .setFontSize(15).setFontWeight('bold').setFontColor('#1F3864').setHorizontalAlignment('center');
+  ws.setRowHeight(1, 32);
 
-  // Section A: Avg delay by route × hour
-  var cols = ['מסלול','כיוון','שעה','מס\' דגימות','השהיה ממוצעת (דק\')','מהירות ממוצעת','רמה ממוצעת'];
-  _hdrRow(ws, cols, 3);
-  var row = 4;
-  ROUTES.forEach(function(route) {
-    [{label:route.dir1_label, streets:route.streets_dir1},
-     {label:route.dir2_label, streets:route.streets_dir2}].forEach(function(dir) {
-      if (!dir.label || !dir.streets.length) return;
-      var rj = _getJamsForStreets(raw, dir.streets);
-      if (!rj.length) return;
-      var byHour = {};
-      rj.forEach(function(j) {
-        var h = j.hour;
-        (byHour[h] = byHour[h] || []).push(j);
-      });
-      Object.keys(byHour).sort(function(a,b){return +a-+b;}).forEach(function(h) {
-        var arr = byHour[h];
-        var avgD = _round1(_mean(arr.map(function(j){return j.delay_s;}))/60);
-        var avgS = _round1(_mean(arr.filter(function(j){return j.speed>0;}).map(function(j){return j.speed;})));
-        var avgL = _round1(_mean(arr.map(function(j){return j.level;})));
-        _dataRow(ws, row, [route.name, dir.label, _pad(+h)+':00',
-                           arr.length, avgD, avgS, avgL], row%2===0);
-        _colorEst(ws, row, 5, route.free_flow_min + avgD, route.free_flow_min);
-        row++;
-      });
-    });
+  // intro row 2 written AFTER _autoWidth at the end
+
+  var rows = arch.getRange(2, 1, arch.getLastRow() - 1, BASELINE_COLS.length).getValues();
+
+  // resolve dir labels
+  var dirLabel = {};
+  ROUTES.forEach(function(r) {
+    dirLabel[r.name + '::1'] = r.dir1_label || '';
+    dirLabel[r.name + '::2'] = r.dir2_label || '';
   });
-  ws.setFrozenRows(3);
+
+  // Sort: date desc, route asc, dir asc, hour asc
+  rows.sort(function(a, b) {
+    var da = a[2] instanceof Date ? a[2].getTime() : new Date(a[2]).getTime();
+    var db = b[2] instanceof Date ? b[2].getTime() : new Date(b[2]).getTime();
+    if (da !== db) return db - da;
+    if (a[0] !== b[0]) return a[0] < b[0] ? -1 : 1;
+    if (a[1] !== b[1]) return a[1] - b[1];
+    return a[3] - b[3];
+  });
+
+  var cols = ['תאריך','סוג יום','מסלול','כיוון','שעה','מס\' פקקים',
+              'השהיה ממוצעת (דק\')','מהירות ממוצעת','רמה ממוצעת'];
+  _hdrRow(ws, cols, 3);
+
+  var row = 4;
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    var route=r[0], dir=r[1], date=r[2], hour=r[3];
+    var n=+r[4]||0, sumD=+r[5]||0, sumS=+r[6]||0, sumL=+r[7]||0;
+    if (!n) continue;
+    var dateStr = date instanceof Date
+      ? Utilities.formatDate(date, 'Asia/Jerusalem', 'yyyy-MM-dd')
+      : String(date);
+    var dt = _dayTypeFromDate(dateStr);
+    var avgD = _round1((sumD / n) / 60);
+    var avgS = _round1(sumS / n);
+    var avgL = _round1(sumL / n);
+    _dataRow(ws, row, [
+      dateStr, dt === 'weekend' ? 'סופ"ש' : 'חול',
+      route, dirLabel[route+'::'+dir] || ('כיוון '+dir),
+      _pad(hour)+':00',
+      n, avgD, avgS, avgL
+    ], row % 2 === 0);
+    row++;
+    if (row > 5000) break;   // protect against huge archive — show most recent 5K rows
+  }
+
   _autoWidth(ws, cols.length);
+  _tabIntro(ws, cols.length, 'תצוגה ישירה של הארכיון הקבוע _baseline_archive (כל ההיסטוריה, לא רק 30 הימים האחרונים). שורה לכל תאריך × מסלול × כיוון × שעה. ממוין מהחדש לישן. מציג עד 5,000 שורות.', 2);
+  ws.setFrozenRows(3);
 }
