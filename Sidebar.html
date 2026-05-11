@@ -119,6 +119,16 @@
   <button class="btn" onclick="doFilter()">החל סינון ובנה גיליונות</button>
   <button class="btn secondary" onclick="resetFilter()">אפס סינון</button>
   <div class="status" id="filterStatus"></div>
+
+  <hr style="margin:18px 0 12px;border:none;border-top:1px solid #e2e8f0">
+  <label>💾 ארכיון ארוך-טווח</label>
+  <div style="font-size:11px;color:#64748b;line-height:1.6;margin-bottom:8px">
+    נתונים מעל 30 יום נשמרים אוטומטית כקבצי CSV ב-Google Drive (תיקייה: <strong>Waze Archive</strong>) ומופיעים בלשונית <strong>ארכיון נפרד</strong> בגיליון.
+  </div>
+  <button class="btn secondary" onclick="doExportArchive()" style="margin-top:0">
+    📤 ייצא הכל ל-Drive עכשיו
+  </button>
+  <div class="status" id="exportStatus"></div>
 </div>
 
 <!-- ─── AUTOMATION PANEL ─── -->
@@ -366,6 +376,52 @@
         showStatus('autoStatus', '❌ ' + err.message, 'error');
       })
       .activateTriggerHere();
+  }
+
+  var archivePollTimer = null;
+
+  function doExportArchive() {
+    if (archivePollTimer) { clearInterval(archivePollTimer); archivePollTimer = null; }
+    showStatus('exportStatus', 'מייצא ל-Drive... ⏳', 'loading');
+    google.script.run
+      .withSuccessHandler(function(r) {
+        if (!r.ok) { showStatus('exportStatus', '❌ ' + r.error, 'error'); return; }
+        if (r.done) {
+          showStatus('exportStatus',
+            '✅ נשמר ב-Drive\nקובץ: ' + r.filename + '\nפקקים: ' + r.count, 'success');
+          return;
+        }
+        showStatus('exportStatus',
+          '⏳ מייצא ברקע... ' + r.progress.processed + ' / ' + r.progress.total +
+          '\n(הריצה תמשיך אוטומטית)', 'loading');
+        startArchivePolling();
+      })
+      .withFailureHandler(function(err) {
+        showStatus('exportStatus', '❌ ' + err.message, 'error');
+      })
+      .exportFullArchive();
+  }
+
+  function startArchivePolling() {
+    if (archivePollTimer) clearInterval(archivePollTimer);
+    archivePollTimer = setInterval(function() {
+      google.script.run
+        .withSuccessHandler(function(s) {
+          if (!s.active) {
+            clearInterval(archivePollTimer); archivePollTimer = null;
+            showStatus('exportStatus', '✅ נשמר ב-Drive\nקובץ: ' + (s.filename || ''), 'success');
+            return;
+          }
+          showStatus('exportStatus',
+            '⏳ מייצא ברקע... ' + s.processed + ' / ' + s.total +
+            '\n(הריצה תמשיך אוטומטית)', 'loading');
+        })
+        .withFailureHandler(function(err) {
+          clearInterval(archivePollTimer); archivePollTimer = null;
+          showStatus('exportStatus', '❌ ' + err.message, 'error');
+        })
+        .getArchiveJobStatus();
+    }, 5000);
   }
 
   function resetFilter() {

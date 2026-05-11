@@ -10,13 +10,38 @@ var SOURCES_SHEET = 'מקור';
 var FILTER_SHEET  = '_filter';   // hidden, stores last applied filter
 var RETENTION_DAYS = 30;
 
+// Resumable archive job: bounded work per execution, resumed via time trigger.
+var ARCHIVE_CHUNK_ROWS    = 5000;
+var ARCHIVE_TIME_BUDGET_MS = 4.5 * 60 * 1000;  // leave headroom under the 6-min cap
+var ARCHIVE_JOB_PROP       = 'archiveJob';
+var ARCHIVE_TRIGGER_FN     = '_continueArchiveJob';
+
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('🚦 Waze')
     .addItem('פתח סרגל צד...', 'showSidebar')
     .addSeparator()
+    .addItem('💾 ייצא ארכיון מלא ל-Drive', 'menuExportArchive')
     .addItem('מחק את כל הנתונים', 'clearAllData')
     .addToUi();
+}
+
+function menuExportArchive() {
+  var ui = SpreadsheetApp.getUi();
+  var r = exportFullArchive();
+  if (!r.ok) { ui.alert('שגיאה', r.error, ui.ButtonSet.OK); return; }
+  if (r.done) {
+    ui.alert('הצלחה',
+      'הארכיון נשמר ל-Google Drive\n\n' +
+      'שם קובץ: ' + r.filename + '\n' +
+      'מספר פקקים: ' + r.count + '\n\n' +
+      'פתח ב: ' + r.url, ui.ButtonSet.OK);
+  } else {
+    ui.alert('בתהליך',
+      'הגיבוי גדול מדי לריצה אחת — ממשיך ברקע אוטומטית.\n\n' +
+      'התקדמות: ' + r.progress.processed + ' מתוך ' + r.progress.total + '\n' +
+      'בדוק שוב בעוד מספר דקות (תיקייה: Waze Archive).', ui.ButtonSet.OK);
+  }
 }
 
 function showSidebar() {
@@ -386,23 +411,32 @@ function _logSource(ss, snapshotTs, jamCount) {
 }
 
 function _pruneOld(ss) {
+  // If a chunked archive job is mid-flight, skip — it will resume via trigger and
+  // delete its own pruned rows on completion.
+  if (_getArchiveJob()) return;
+
   var cutoff = new Date(Date.now() - RETENTION_DAYS * 86400000);
-  // Prune raw_data
+
   var raw = ss.getSheetByName(RAW_SHEET);
   if (raw && raw.getLastRow() > 1) {
-    var data = raw.getRange(2, 1, raw.getLastRow() - 1, 1).getValues();
+    var nRows = raw.getLastRow() - 1;
+    // Read just the date column to find the boundary — avoids loading the whole sheet.
+    var dates = raw.getRange(2, 1, nRows, 1).getValues();
     var firstKeep = -1;
-    for (var i = 0; i < data.length; i++) {
-      if (new Date(data[i][0]) >= cutoff) { firstKeep = i; break; }
+    for (var i = 0; i < dates.length; i++) {
+      if (new Date(dates[i][0]) >= cutoff) { firstKeep = i; break; }
     }
-    if (firstKeep > 0) {
-      raw.deleteRows(2, firstKeep);
-    } else if (firstKeep === -1) {
-      // all old
-      raw.deleteRows(2, data.length);
+    var pruneCount = 0;
+    if (firstKeep > 0) pruneCount = firstKeep;
+    else if (firstKeep === -1) pruneCount = nRows;
+
+    if (pruneCount > 0) {
+      // Start a chunked archive job; deleteRows happens in _finalizeArchive after success.
+      _startArchiveJob(ss, raw, pruneCount, 'prune');
     }
   }
-  // Prune sources
+
+  // Prune sources log (small, safe to do inline)
   var src = ss.getSheetByName(SOURCES_SHEET);
   if (src && src.getLastRow() > 1) {
     var data2 = src.getRange(2, 1, src.getLastRow() - 1, 1).getValues();
@@ -413,6 +447,222 @@ function _pruneOld(ss) {
     if (firstKeep2 > 0) src.deleteRows(2, firstKeep2);
     else if (firstKeep2 === -1) src.deleteRows(2, data2.length);
   }
+}
+
+// ─── Long-term archive to Google Drive (chunked + resumable) ────────
+function _archiveFolder(ss) {
+  var name = 'Waze Archive — ' + ss.getName();
+  var iter = DriveApp.getFoldersByName(name);
+  return iter.hasNext() ? iter.next() : DriveApp.createFolder(name);
+}
+
+function _archiveProps() { return PropertiesService.getDocumentProperties(); }
+function _getArchiveJob() {
+  var s = _archiveProps().getProperty(ARCHIVE_JOB_PROP);
+  return s ? JSON.parse(s) : null;
+}
+function _setArchiveJob(job) { _archiveProps().setProperty(ARCHIVE_JOB_PROP, JSON.stringify(job)); }
+function _clearArchiveJob() { _archiveProps().deleteProperty(ARCHIVE_JOB_PROP); }
+
+function _scheduleArchiveContinuation() {
+  var trigs = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < trigs.length; i++) {
+    if (trigs[i].getHandlerFunction() === ARCHIVE_TRIGGER_FN) return;
+  }
+  ScriptApp.newTrigger(ARCHIVE_TRIGGER_FN).timeBased().after(1000).create();
+}
+
+function _deleteArchiveContinuationTriggers() {
+  var trigs = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < trigs.length; i++) {
+    if (trigs[i].getHandlerFunction() === ARCHIVE_TRIGGER_FN) {
+      ScriptApp.deleteTrigger(trigs[i]);
+    }
+  }
+}
+
+function _pad(n, w) {
+  var s = String(n);
+  while (s.length < w) s = '0' + s;
+  return s;
+}
+
+function _formatRowCSV(r) {
+  var out = [];
+  for (var k = 0; k < r.length; k++) {
+    var c = r[k];
+    var s;
+    if (c === null || c === undefined) s = '';
+    else if (c instanceof Date) s = Utilities.formatDate(c, 'Asia/Jerusalem', 'yyyy-MM-dd HH:mm:ss');
+    else s = String(c);
+    if (s.indexOf(',') !== -1 || s.indexOf('"') !== -1 || s.indexOf('\n') !== -1) {
+      s = '"' + s.replace(/"/g, '""') + '"';
+    }
+    out.push(s);
+  }
+  return out.join(',');
+}
+
+function _chunkToCSV(rows, includeHeader) {
+  var lines = includeHeader ? [RAW_COLS.join(',')] : [];
+  for (var i = 0; i < rows.length; i++) lines.push(_formatRowCSV(rows[i]));
+  return lines.join('\n');
+}
+
+function _logArchiveFile(ss, filename, url, jamCount, firstDate, lastDate) {
+  var name = 'ארכיון נפרד';
+  var s = ss.getSheetByName(name);
+  if (!s) {
+    s = ss.insertSheet(name);
+    s.setTabColor('#7C3AED');
+    try { s.setRightToLeft(true); } catch(e) {}
+    s.getRange(1, 1, 1, 6).setValues([['נשמר ב-','שם קובץ','מתאריך','עד תאריך','מס\' פקקים','קישור']])
+     .setBackground('#1F3864').setFontColor('#fff').setFontWeight('bold')
+     .setHorizontalAlignment('center');
+    s.setFrozenRows(1);
+  }
+  var lastRow = s.getLastRow() + 1;
+  s.getRange(lastRow, 1, 1, 6).setValues([[
+    new Date(),
+    filename,
+    Utilities.formatDate(new Date(firstDate), 'Asia/Jerusalem', 'yyyy-MM-dd'),
+    Utilities.formatDate(new Date(lastDate),  'Asia/Jerusalem', 'yyyy-MM-dd'),
+    jamCount,
+    '=HYPERLINK("' + url + '", "פתח ב-Drive")',
+  ]]).setHorizontalAlignment('center').setFontFamily('Arial').setFontSize(10);
+  for (var c = 1; c <= 6; c++) s.autoResizeColumn(c);
+}
+
+// Manual export: dump current raw_data to Drive WITHOUT deleting from sheet.
+// Returns { ok, done, ... } — when done=false a background trigger continues the job.
+function exportFullArchive() {
+  var existing = _getArchiveJob();
+  if (existing) {
+    return {
+      ok: true, done: false, inProgress: true,
+      progress: { processed: existing.nextRow - 1, total: existing.totalRows },
+      filename: existing.filename,
+    };
+  }
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var raw = ss.getSheetByName(RAW_SHEET);
+  if (!raw || raw.getLastRow() < 2) {
+    return { ok: false, error: 'אין נתונים לייצוא' };
+  }
+  return _startArchiveJob(ss, raw, raw.getLastRow() - 1, 'manual');
+}
+
+function getArchiveJobStatus() {
+  var job = _getArchiveJob();
+  if (!job) return { active: false };
+  return {
+    active: true,
+    processed: job.nextRow - 1,
+    total: job.totalRows,
+    filename: job.filename,
+    source: job.source,
+  };
+}
+
+function _startArchiveJob(ss, raw, totalRows, source) {
+  // Snapshot the date range from the rows we're about to archive (rows 2..totalRows+1).
+  var firstDate = raw.getRange(2, 1).getValue();
+  var lastDate = raw.getRange(totalRows + 1, 1).getValue();
+  var fmt = function(d) { return Utilities.formatDate(new Date(d), 'Asia/Jerusalem', 'yyyy-MM-dd'); };
+  var stamp = Utilities.formatDate(new Date(), 'Asia/Jerusalem', 'yyyyMMdd-HHmmss');
+  var filename = 'waze-archive_' + fmt(firstDate) + '_to_' + fmt(lastDate) + '_' + stamp + '.csv';
+
+  var job = {
+    filename: filename,
+    totalRows: totalRows,
+    nextRow: 1,                                      // 1-indexed within data; sheet row = nextRow + 1
+    firstDate: new Date(firstDate).toISOString(),
+    lastDate: new Date(lastDate).toISOString(),
+    partFileIds: [],
+    source: source,                                  // 'manual' | 'prune'
+    pruneRowCount: source === 'prune' ? totalRows : 0,
+  };
+  _setArchiveJob(job);
+  return _runArchiveSlice();
+}
+
+function _continueArchiveJob() {
+  // Triggered by a one-shot time trigger; clear it first so a thrown error won't loop.
+  _deleteArchiveContinuationTriggers();
+  try { _runArchiveSlice(); }
+  catch(e) {
+    Logger.log('Archive continuation failed: ' + e.message);
+    // Reschedule once so a transient error gets a retry; user can also re-run manually.
+    _scheduleArchiveContinuation();
+  }
+}
+
+function _runArchiveSlice() {
+  var job = _getArchiveJob();
+  if (!job) return { ok: false, error: 'אין ג\'וב פעיל' };
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var raw = ss.getSheetByName(RAW_SHEET);
+  if (!raw) {
+    _clearArchiveJob();
+    return { ok: false, error: 'גיליון raw_data לא נמצא' };
+  }
+  var folder = _archiveFolder(ss);
+  var startedAt = Date.now();
+
+  while (job.nextRow <= job.totalRows) {
+    if (Date.now() - startedAt > ARCHIVE_TIME_BUDGET_MS) {
+      _setArchiveJob(job);
+      _scheduleArchiveContinuation();
+      return {
+        ok: true, done: false,
+        progress: { processed: job.nextRow - 1, total: job.totalRows },
+        filename: job.filename,
+      };
+    }
+    var remaining = job.totalRows - (job.nextRow - 1);
+    var size = Math.min(ARCHIVE_CHUNK_ROWS, remaining);
+    var sheetRow = job.nextRow + 1;
+    var rows = raw.getRange(sheetRow, 1, size, RAW_COLS.length).getValues();
+    var includeHeader = (job.partFileIds.length === 0);
+    var csv = _chunkToCSV(rows, includeHeader);
+    var partName = job.filename.replace(/\.csv$/, '') + '__part' + _pad(job.partFileIds.length + 1, 3) + '.csv';
+    var partFile = folder.createFile(partName, csv, 'text/csv');
+    job.partFileIds.push(partFile.getId());
+    job.nextRow += size;
+    _setArchiveJob(job);
+  }
+
+  return _finalizeArchive(ss, folder, job);
+}
+
+function _finalizeArchive(ss, folder, job) {
+  var pieces = [];
+  for (var i = 0; i < job.partFileIds.length; i++) {
+    pieces.push(DriveApp.getFileById(job.partFileIds[i]).getBlob().getDataAsString());
+  }
+  var finalFile = folder.createFile(job.filename, pieces.join('\n'), 'text/csv');
+
+  for (var j = 0; j < job.partFileIds.length; j++) {
+    try { DriveApp.getFileById(job.partFileIds[j]).setTrashed(true); } catch(e) {}
+  }
+
+  _logArchiveFile(ss, job.filename, finalFile.getUrl(), job.totalRows,
+    new Date(job.firstDate), new Date(job.lastDate));
+
+  if (job.source === 'prune' && job.pruneRowCount > 0) {
+    var raw = ss.getSheetByName(RAW_SHEET);
+    if (raw) raw.deleteRows(2, job.pruneRowCount);
+  }
+
+  _clearArchiveJob();
+  _deleteArchiveContinuationTriggers();
+
+  return {
+    ok: true, done: true,
+    count: job.totalRows,
+    url: finalFile.getUrl(),
+    filename: job.filename,
+  };
 }
 
 function _countSnapshots(ss) {
