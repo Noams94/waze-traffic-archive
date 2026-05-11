@@ -1683,10 +1683,38 @@ function _sheet6_legend(ss) {
     { type: ROW, a: 'archived', b: 'דגל: האם הפקק כבר נספר ל-_baseline_archive (מונע ספירה כפולה).' },
 
     { type: BLANK },
-    { type: SEC, text: '§3. ארכיטקטורת הנתונים' },
-    { type: ROW, a: 'raw_data', b: 'גיליון גרעיני. שורה לכל פקק בכל snapshot. נשמר 30 יום ואז עובר prune אוטומטי.' },
-    { type: ROW, a: '_baseline_archive', b: 'גיליון מוסתר. רשומה מצטברת לכל (מסלול × כיוון × תאריך × שעה) — n, סכום delay, סכום speed, סכום level. לעולם לא נמחק. זה מקור האמת לכל baseline היסטורי.' },
-    { type: ROW, a: 'לשוניות הניתוח', b: 'נבנות מחדש בכל "החל סינון". הפילטר חל על raw_data, אבל ההשוואות נעשות מול _baseline_archive (כל ההיסטוריה).' },
+    { type: SEC, text: '§3. ארכיטקטורת הנתונים — סוגי לשוניות' },
+    { type: HDR, a: 'לשונית', b: 'מתי מתעדכנת ומה היא צוברת' },
+
+    { type: ROW, a: '🔄 7 לשוניות הניתוח',
+      b: 'לוח מחוונים · סיכום מסלולים · פירוט לפי שעה · השוואת כיוונים · חריגות · פירוט פקקים · מקרא ומתודולוגיה — **נמחקות ונבנות מחדש בכל "החל סינון"**. הפילטר חל על raw_data, אבל ההשוואות מול _baseline_archive (כל ההיסטוריה).' },
+
+    { type: ROW, a: '🔁 אגרגציה לאורך זמן',
+      b: 'נבנית מחדש **רק בעת upload חדש**, לא בעת סינון. תצוגה של _baseline_archive ממוין מהחדש לישן.' },
+
+    { type: ROW, a: '📥 raw_data',
+      b: 'גלוי. שורה לכל פקק בכל snapshot — מקור גרעיני. עמודות: snapshot_ts, pub_ts, date, day, hour, tbin, street, city, level, length_m, delay_s, speed_kmh, start_node, end_node, tt_min, route_name, dir_ix, archived. **נשמר 30 יום ואז עובר prune אוטומטי** (השורות הישנות מיוצאות ל-Drive כ-CSV לפני המחיקה).' },
+
+    { type: ROW, a: '💎 _baseline_archive',
+      b: 'מוסתר. **לעולם לא נמחק** — מקור האמת לכל baseline היסטורי. רשומה מצטברת פר (route, dir, date, hour) עם n, sum_delay_s, sum_speed, sum_level, last_updated. מתעדכן upsert בכל upload חדש. גם אחרי שה-raw_data של פקק מסוים נמחק, המונה שלו ממשיך להשפיע על ה-baseline.' },
+
+    { type: ROW, a: '📋 מקור',
+      b: 'גלוי. יומן הופעות snapshot — חותמת זמן, תאריך, שעה, מספר פקקים בכל upload. משמש לזיהוי כפילויות (אם startTime זהה כבר קיים, ה-upload נדחה). נשמר 30 יום.' },
+
+    { type: ROW, a: '📁 ארכיון נפרד',
+      b: 'גלוי. יומן של הייצואים ל-Drive (שם קובץ, טווח תאריכים, קישור). מתעדכן בכל ייצוא של 30 הימים שעוברים prune או ייצוא ידני.' },
+
+    { type: ROW, a: '🔒 _config (מוסתר)',
+      b: 'תצורת auto-fetch: fetch_url, fetch_headers, fetch_interval, trigger_owner. נשמר ברמת הגיליון כדי לשרוד החלפת מחשבים/חשבונות.' },
+
+    { type: ROW, a: '🔒 _fetch_log (מוסתר)',
+      b: 'יומן ריצות של ה-auto-fetch — חותמת זמן, משתמש, סטטוס (הצלחה/כפילות/שגיאה), מספר פקקים, הודעת שגיאה. שימושי לדיבאג של ה-cron.' },
+
+    { type: ROW, a: '🔒 _filter (מוסתר)',
+      b: 'הפילטר האחרון שהוחל (JSON blob: fromDate, toDate, fromHour, toHour, days). נדרס בכל "החל סינון".' },
+
+    { type: ROW, a: 'עיקרון מפתח',
+      b: 'הסינון מסנן את raw_data בלבד. ה-baseline-ים תמיד מגיעים מ-_baseline_archive המלא, ללא קשר לפילטר. כך "מה שאתה רואה בטווח שבחרת" מושווה תמיד מול "כל מה שהמערכת יודעת מההיסטוריה".' },
 
     { type: BLANK },
     { type: SEC, text: '§4. איך מחושב baseline היסטורי' },
