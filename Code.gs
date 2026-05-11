@@ -1402,13 +1402,8 @@ function _sheet1_summary(ss, jams, filter, baselines) {
     .setValue('מסנן: ' + _filterLabel(filter) + ' | פקקים: ' + jams.length)
     .setFontSize(10).setFontColor('#666').setHorizontalAlignment('center');
 
-  ws.getRange(3, 1, 1, nc).merge()
-    .setValue('ℹ️ שורה לכל מסלול. שני הכיוונים מוצגים זה ליד זה. עמודות "סטייה כ1/כ2" משוות מול ממוצע היסטורי כללי של הכיוון (לא ספציפי לשעה — לרזולוציה לפי שעה ראה "פירוט לפי שעה").')
-    .setBackground('#E0F2FE').setFontColor('#075985')
-    .setFontSize(10).setFontStyle('italic')
-    .setHorizontalAlignment('right').setVerticalAlignment('middle').setWrap(true);
-  ws.setRowHeight(3, 36);
-
+  // intro row 3 will be written AFTER _autoWidth at the end of this function,
+  // so the merged intro text doesn't influence column auto-sizing.
   _hdrRow(ws, cols, 4);
 
   var row = 5, curSec = '';
@@ -1444,8 +1439,9 @@ function _sheet1_summary(ss, jams, filter, baselines) {
     if (dev2 && dev2.pct !== undefined) _colorDeviation(ws, row, 16, dev2.pct);
     row++;
   });
-  ws.setFrozenRows(4);
   _autoWidth(ws, nc);
+  _tabIntro(ws, nc, 'שורה לכל מסלול. שני הכיוונים מוצגים זה ליד זה. עמודות "סטייה כ1/כ2" משוות מול ממוצע היסטורי כללי של הכיוון (לא ספציפי לשעה — לרזולוציה לפי שעה ראה "פירוט לפי שעה").', 3);
+  ws.setFrozenRows(4);
 }
 
 function _sheet2_timebins(ss, jams, baselines) {
@@ -1454,7 +1450,6 @@ function _sheet2_timebins(ss, jams, baselines) {
               'מס\' פקקים','אורך (ק"מ)','השהיה (דק\')','מהירות ממוצעת','רמת פקק ממוצעת',
               'השהיה לפקק (דק\')','ממוצע היסטורי (דק\')','מקור השוואה','n',
               'סטייה %','סטטוס'];
-  _tabIntro(ws, cols.length, 'הלב של הניתוח. שורה לכל מסלול × כיוון × שעה × סוג יום (חול/סופ"ש). "סטייה %" אומרת אם המצב כעת גרוע (חיובי) או טוב (שלילי) ביחס להיסטוריה באותה שעה. "מקור השוואה": "שעה זו" = השוואה מדויקת; "±1/±2 שעות" = הורחב כי אין מספיק דגימות; "—" = אין מספיק היסטוריה.', 1);
   _hdrRow(ws, cols, 2);
 
   var row = 3;
@@ -1526,15 +1521,15 @@ function _sheet2_timebins(ss, jams, baselines) {
       });
     });
   });
-  ws.setFrozenRows(2);
   _autoWidth(ws, cols.length);
+  _tabIntro(ws, cols.length, 'הלב של הניתוח. שורה לכל מסלול × כיוון × שעה × סוג יום (חול/סופ"ש). "סטייה %" אומרת אם המצב כעת גרוע (חיובי) או טוב (שלילי) ביחס להיסטוריה באותה שעה. "מקור השוואה": "שעה זו" = השוואה מדויקת; "±1/±2 שעות" = הורחב כי אין מספיק דגימות; "—" = אין מספיק היסטוריה.', 1);
+  ws.setFrozenRows(2);
 }
 
 function _sheet3_directions(ss, jams) {
   var ws = _newSheet(ss, 'השוואת כיוונים', '#ED7D31');
   var cols = ['אזור','מסלול','מרחק','זמן חופשי','כיוון 1','כיוון 2',
               'השהיה כ1','השהיה כ2','זמן כ1','זמן כ2','הפרש','כיוון עמוס','יחס'];
-  _tabIntro(ws, cols.length, 'השוואת שני כיוונים זה מול זה — רק מסלולים דו-כיווניים. "כיוון עמוס" מסומן באדום; "יחס" מציג כמה פעמים אחד עמוס מהשני (1.5x = פי 1.5).', 1);
   _hdrRow(ws, cols, 2);
   var row = 3;
   ROUTES.forEach(function(route) {
@@ -1556,15 +1551,15 @@ function _sheet3_directions(ss, jams) {
     ws.getRange(row, bc).setBackground(C_RED_BG).setFontColor(C_RED_FG).setFontWeight('bold');
     row++;
   });
-  ws.setFrozenRows(2);
   _autoWidth(ws, cols.length);
+  _tabIntro(ws, cols.length, 'השוואת שני כיוונים זה מול זה — רק מסלולים דו-כיווניים. "כיוון עמוס" מסומן באדום; "יחס" מציג כמה פעמים אחד עמוס מהשני (1.5x = פי 1.5).', 1);
+  ws.setFrozenRows(2);
 }
 
 function _sheet4_anomalies(ss, jams) {
   var ws = _newSheet(ss, 'חריגות', '#C00000');
   var cols = ['#','אזור','מסלול','כיוון','קטע','עיר','תאריך','יום','שעה','מרווח',
               'מהירות','אורך (מ\')','השהיה (דק\')','ממוצע (דק\')','חריגה %','רמת פקק','חומרה'];
-  _tabIntro(ws, cols.length, 'פקקים בודדים שבולטים מאוד בתוך הפילטר הנוכחי. הקריטריון מקומי (1.5σ מעל הממוצע, או speed<5, או level≥4) — לא היסטורי. ממוין לפי חומרה ואז גודל ההשהיה.', 1);
   _hdrRow(ws, cols, 2);
   var anoms = [];
   ROUTES.forEach(function(route) {
@@ -1603,15 +1598,15 @@ function _sheet4_anomalies(ss, jams) {
     _colorStatus(ws, row, 17, a.sv==='קריטי'?'חריג מאוד':a.sv==='גבוה'?'עמוס':'מתון');
     row++;
   });
-  ws.setFrozenRows(2);
   _autoWidth(ws, cols.length);
+  _tabIntro(ws, cols.length, 'פקקים בודדים שבולטים מאוד בתוך הפילטר הנוכחי. הקריטריון מקומי (1.5σ מעל הממוצע, או speed<5, או level≥4) — לא היסטורי. ממוין לפי חומרה ואז גודל ההשהיה.', 1);
+  ws.setFrozenRows(2);
 }
 
 function _sheet5_detail(ss, jams) {
   var ws = _newSheet(ss, 'פירוט פקקים', '#548235');
   var cols = ['#','אזור','מסלול','כיוון','קטע','עיר','תאריך','יום','שעה','מרווח',
               'מהירות','אורך (מ\')','השהיה (שנ\')','זמן נסיעה (דק\')','רמת פקק'];
-  _tabIntro(ws, cols.length, 'יומן מלא של כל הפקקים בפילטר הנוכחי — שורה לכל פקק יחיד. ממוין לפי מסלול → כיוון → זמן. שימושי לחפירה לעומק.', 1);
   _hdrRow(ws, cols, 2);
   var row = 3, idx = 1;
   ROUTES.forEach(function(route) {
@@ -1630,8 +1625,9 @@ function _sheet5_detail(ss, jams) {
       });
     });
   });
-  ws.setFrozenRows(2);
   _autoWidth(ws, cols.length);
+  _tabIntro(ws, cols.length, 'יומן מלא של כל הפקקים בפילטר הנוכחי — שורה לכל פקק יחיד. ממוין לפי מסלול → כיוון → זמן. שימושי לחפירה לעומק.', 1);
+  ws.setFrozenRows(2);
 }
 
 function _sheet6_legend(ss) {
@@ -1797,12 +1793,7 @@ function _rebuildAggregation(ss) {
     .setFontSize(15).setFontWeight('bold').setFontColor('#1F3864').setHorizontalAlignment('center');
   ws.setRowHeight(1, 32);
 
-  ws.getRange(2, 1, 1, ncW).merge()
-    .setValue('ℹ️ תצוגה ישירה של הארכיון הקבוע _baseline_archive (כל ההיסטוריה, לא רק 30 הימים האחרונים). שורה לכל תאריך × מסלול × כיוון × שעה. ממוין מהחדש לישן. מציג עד 5,000 שורות.')
-    .setBackground('#E0F2FE').setFontColor('#075985')
-    .setFontSize(10).setFontStyle('italic')
-    .setHorizontalAlignment('right').setVerticalAlignment('middle').setWrap(true);
-  ws.setRowHeight(2, 36);
+  // intro row 2 written AFTER _autoWidth at the end
 
   var rows = arch.getRange(2, 1, arch.getLastRow() - 1, BASELINE_COLS.length).getValues();
 
@@ -1850,6 +1841,7 @@ function _rebuildAggregation(ss) {
     if (row > 5000) break;   // protect against huge archive — show most recent 5K rows
   }
 
-  ws.setFrozenRows(3);
   _autoWidth(ws, cols.length);
+  _tabIntro(ws, cols.length, 'תצוגה ישירה של הארכיון הקבוע _baseline_archive (כל ההיסטוריה, לא רק 30 הימים האחרונים). שורה לכל תאריך × מסלול × כיוון × שעה. ממוין מהחדש לישן. מציג עד 5,000 שורות.', 2);
+  ws.setFrozenRows(3);
 }
