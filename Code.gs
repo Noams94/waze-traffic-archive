@@ -1632,6 +1632,8 @@ function _sheet5_detail(ss, jams) {
 
 function _sheet6_legend(ss) {
   var ws = _newSheet(ss, 'מקרא ומתודולוגיה', '#666666');
+  // Position as the first tab — entry point for users
+  try { ss.setActiveSheet(ws); ss.moveActiveSheet(1); } catch(e) {}
 
   var SEC = 'section', HDR = 'header', ROW = 'row', BLANK = 'blank';
   var items = [
