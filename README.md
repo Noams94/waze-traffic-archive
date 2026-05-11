@@ -56,15 +56,39 @@ Google Sheets + Apps Script tool for archiving and analyzing raw Waze API JSON s
 
 ## Data model
 
+Sheets fall into three categories: **rebuilt on filter apply**, **rebuilt on upload**, and **persistent** (accumulating, never cleared by user actions).
+
+### Rebuilt on every "החל סינון" (cleared and redrawn from filtered `raw_data`)
+
+| Sheet | Purpose |
+|-------|---------|
+| 🎯 לוח מחוונים | One-page dashboard — KPIs, top 10 worst, best 5, section breakdown |
+| סיכום מסלולים | Per-route summary table |
+| פירוט לפי שעה | Hour-by-hour breakdown (weekday vs weekend separated) |
+| השוואת כיוונים | Direction-vs-direction for two-way routes |
+| חריגות | Local outlier detection (1.5σ / speed / level) |
+| פירוט פקקים | Full jam log |
+| מקרא ומתודולוגיה | Legend + methodology guide (first tab) |
+
+### Rebuilt only on upload (not on filter apply)
+
+| Sheet | Purpose |
+|-------|---------|
+| אגרגציה לאורך זמן | View of `_baseline_archive` — all-time trends, sorted newest first |
+
+### Persistent — accumulate over time, untouched by filters
+
 | Sheet | Persistence | Purpose |
 |-------|-------------|---------|
 | `raw_data` | append-only, auto-pruned > 30 days | one row per jam per snapshot. Extra cols: `route_name`, `dir_ix`, `archived` (flag) |
-| `_baseline_archive` | hidden, **permanent** | aggregated counters per `(route, dir, date, hour)` — `n, sum_delay_s, sum_speed, sum_level`. Source of truth for all historical baselines. |
-| `מקור` | append-only, auto-pruned | log of every upload (`startTime`, jam count) |
+| `_baseline_archive` | hidden, **never pruned** | aggregated counters per `(route, dir, date, hour)` — `n, sum_delay_s, sum_speed, sum_level`. Source of truth for all historical baselines. |
+| `מקור` | append-only, auto-pruned > 30 days | log of every upload (`startTime`, jam count) |
+| `ארכיון נפרד` | append-only | log of CSV exports to Drive (filename, date range, link) |
 | `_config` | hidden | URL, headers, interval, trigger owner — persists across users/devices |
 | `_fetch_log` | hidden | log of every scheduled fetch (timestamp, user, status, error) |
-| `_filter` | hidden | last applied filter |
-| Analysis sheets (8) | rebuilt on each filter apply | derived views |
+| `_filter` | hidden, overwritten each filter | last applied filter (JSON blob) |
+
+**Key principle:** filtering only affects which `raw_data` rows feed the analysis tabs. Baselines for deviation calculations always come from the full `_baseline_archive` regardless of the filter — so "what I'm seeing in my chosen range" is always compared against "everything I know historically."
 
 ### Migrating from a pre-archive snapshot
 
