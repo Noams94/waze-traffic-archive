@@ -168,6 +168,12 @@ function applyFilter(filter) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   _saveFilter(ss, filter);
   try {
+    // Remove legacy/renamed sheets that the current version no longer produces
+    ['פירוט לפי מרווח זמן', 'מקרא'].forEach(function(legacyName) {
+      var legacy = ss.getSheetByName(legacyName);
+      if (legacy) ss.deleteSheet(legacy);
+    });
+
     var raw = _readFiltered(ss, filter);
     if (!raw.length) return { ok: false, error: 'אין נתונים בטווח שנבחר' };
     var baselines = _computeBaselines(ss);          // reads from permanent _baseline_archive
