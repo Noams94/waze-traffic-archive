@@ -112,8 +112,10 @@ function menuResumeArchiveJob() {
     ui.alert('אין ייצוא פעיל', 'לא נמצא ג\'וב ייצוא פעיל לחידוש.', ui.ButtonSet.OK);
     return;
   }
-  // Clean up any orphaned continuation triggers before running
-  _deleteArchiveContinuationTriggers();
+  // Watchdog: if this synchronous slice is hard-killed at the 6-min wall before
+  // the budget-exit code can schedule a continuation, this trigger revives it
+  // at +7 min. Clean exits (done / budget exit) overwrite it.
+  _scheduleArchiveWatchdog();
   try {
     var r = _runArchiveSlice();
     if (r && r.done) {
@@ -163,6 +165,8 @@ function menuMigrateToArchive() {
 
 function menuExportArchive() {
   var ui = SpreadsheetApp.getUi();
+  // Watchdog: synchronous slice — see menuPruneNow for rationale.
+  _scheduleArchiveWatchdog();
   var r = exportFullArchive();
   if (!r.ok) { ui.alert('שגיאה', r.error, ui.ButtonSet.OK); return; }
   if (r.done) {
@@ -184,6 +188,8 @@ function menuExportArchive() {
 // complete snapshot regardless of what was archived before.
 function menuExportArchiveFull() {
   var ui = SpreadsheetApp.getUi();
+  // Watchdog: synchronous slice — see menuPruneNow for rationale.
+  _scheduleArchiveWatchdog();
   var r = exportFullArchiveAll();
   if (!r.ok) { ui.alert('שגיאה', r.error, ui.ButtonSet.OK); return; }
   if (r.done) {
@@ -218,9 +224,15 @@ function menuPruneNow() {
     return;
   }
   var before = raw.getLastRow() - 1;
+  // Watchdog: _pruneOld → _startArchiveJob → _runArchiveSlice runs synchronously.
+  // If a chunk straddles the 6-min wall the execution dies; this trigger revives
+  // the job at +7 min so no manual click is needed.
+  _scheduleArchiveWatchdog();
   _pruneOld(ss);
   var job = _getArchiveJob();
   if (!job) {
+    // No archive started — clear the watchdog we pre-scheduled.
+    _deleteArchiveContinuationTriggers();
     ui.alert('אין שורות לקציצה',
       'כל ' + before + ' השורות ב-raw_data בתוך טווח ה-retention (' + RETENTION_DAYS + ' ימים) ' +
       'וגם מתחת לתקרת ' + MAX_RAW_ROWS + ' שורות. אין מה לקצץ כרגע.',
@@ -1028,11 +1040,20 @@ function _setArchiveJob(job) { _archiveProps().setProperty(ARCHIVE_JOB_PROP, JSO
 function _clearArchiveJob() { _archiveProps().deleteProperty(ARCHIVE_JOB_PROP); }
 
 function _scheduleArchiveContinuation() {
-  var trigs = ScriptApp.getProjectTriggers();
-  for (var i = 0; i < trigs.length; i++) {
-    if (trigs[i].getHandlerFunction() === ARCHIVE_TRIGGER_FN) return;
-  }
+  // Always replace any existing continuation trigger. A budget-exit's fresh
+  // 1-sec trigger must override a long-delay watchdog set by a menu handler.
+  _deleteArchiveContinuationTriggers();
   ScriptApp.newTrigger(ARCHIVE_TRIGGER_FN).timeBased().after(1000).create();
+}
+
+// Watchdog: scheduled before a synchronous slice runs in a menu handler. If the
+// slice exits cleanly (done or budget exit), _finalizeArchive / _scheduleArchiveContinuation
+// removes this. If the calling execution is hard-killed at the 6-min wall before
+// the budget-exit code can run, this trigger fires ~7 min later and resumes
+// the job — no manual click needed.
+function _scheduleArchiveWatchdog() {
+  _deleteArchiveContinuationTriggers();
+  ScriptApp.newTrigger(ARCHIVE_TRIGGER_FN).timeBased().after(7 * 60 * 1000).create();
 }
 
 function _deleteArchiveContinuationTriggers() {
