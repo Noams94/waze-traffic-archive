@@ -12,3 +12,7 @@ __pycache__/
 *.json
 *.xlsx
 !waze_routes_v2.xlsx
+# clasp manifest — must be tracked so push has a manifest to deploy.
+!appsscript.json
+# clasp scriptId is per-developer; keep .clasp.json local.
+.clasp.json

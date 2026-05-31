@@ -10,24 +10,97 @@ var SOURCES_SHEET = 'מקור';
 var FILTER_SHEET  = '_filter';   // hidden, stores last applied filter
 var BASELINE_ARCHIVE = '_baseline_archive';   // hidden, permanent aggregated counters
 var RETENTION_DAYS = 30;
+// Safety cap: Google Sheets enforces ~10M cells per spreadsheet. With 18 RAW_COLS
+// that's ~555K rows before raw_data alone hits the wall — BUT Sheets allocates
+// a small column buffer (typically 2 trailing empty cols), pushing the effective
+// width to 20. To leave breathing room for the buffer + ~200K cells used by the
+// other sheets, trigger emergency prune well below the theoretical max.
+// At 20 cols/row: 450K × 20 = 9M cells, leaving ~1M cells of headroom.
+var MAX_RAW_ROWS = 450000;
 
 // Resumable archive job: bounded work per execution, resumed via time trigger.
-var ARCHIVE_CHUNK_ROWS    = 5000;
-var ARCHIVE_TIME_BUDGET_MS = 4.5 * 60 * 1000;  // leave headroom under the 6-min cap
+// Smaller chunks + tighter budget = more frequent checkpoints and a safer exit
+// well before Apps Script's 6-min wall. A single chunk includes a Drive.createFile
+// call, which can take 30-90s — must leave room for one full chunk after the budget
+// check fires.
+var ARCHIVE_CHUNK_ROWS    = 2000;
+var ARCHIVE_TIME_BUDGET_MS = 3 * 60 * 1000;
 var ARCHIVE_JOB_PROP       = 'archiveJob';
 var ARCHIVE_TRIGGER_FN     = '_continueArchiveJob';
+var ARCHIVE_LAST_TS_PROP   = 'archiveLastTs';   // ISO ts of latest snapshot already archived
+var ARCHIVE_LOG_SHEET      = 'ארכיון נפרד';
+
+// Daily auto-archive: runs exportFullArchive (incremental) + _pruneOld every day at 03:00.
+var DAILY_ARCHIVE_TRIGGER_FN  = '_dailyArchive';
+var DAILY_ARCHIVE_CONFIG_KEY  = 'daily_archive';
+// Legacy weekly trigger handler — kept ONLY so stale triggers don't error out;
+// migration in onOpen removes them.
+var LEGACY_WEEKLY_TRIGGER_FN  = '_weeklyArchive';
+
+// Self-healing fetch: when an import fails because raw_data hit the cell cap,
+// auto-trigger a prune and reschedule the fetch to retry after a short delay.
+// Bounded retry budget with exponential backoff — gives up after MAX attempts
+// so a stuck recovery (prune can't free cells) can't loop forever.
+var FETCH_RETRY_TRIGGER_FN    = '_retryScheduledFetch';
+var FETCH_RETRY_COUNT_PROP    = 'fetchRetryCount';
+var FETCH_RETRY_MAX_ATTEMPTS  = 5;
+var FETCH_RETRY_BACKOFF_MS    = [2, 5, 10, 20, 30].map(function(m){ return m * 60 * 1000; });
+
+// Background monitor: every 6 hours, check whether an archive job exists in
+// PropertiesService without a continuation trigger and resume it. Eliminates
+// the "stuck job" pattern that previously required clicking "המשך ייצוא תקוע".
+var JOB_MONITOR_TRIGGER_FN    = '_monitorArchiveJob';
+
+// Auto-chained prune: fires once after a 'manual' archive completes if
+// raw_data is still over the cap. Lets manual export → prune happen with no
+// user clicks in between.
+var POST_ARCHIVE_PRUNE_FN     = '_postArchivePrune';
 
 function onOpen() {
-  SpreadsheetApp.getUi()
-    .createMenu('🚦 Waze')
-    .addItem('פתח סרגל צד...', 'showSidebar')
-    .addSeparator()
-    .addItem('💾 ייצא ארכיון מלא ל-Drive', 'menuExportArchive')
+  var ui = SpreadsheetApp.getUi();
+  var advanced = ui.createMenu('מתקדם')
+    .addItem('💾 ייצא ארכיון מלא ל-Drive', 'menuExportArchiveFull')
     .addItem('▶️ המשך ייצוא תקוע', 'menuResumeArchiveJob')
     .addItem('🛑 בטל ייצוא תקוע', 'menuCancelArchiveJob')
     .addItem('🔄 העבר נתונים קיימים לארכיון אגרגטיבי', 'menuMigrateToArchive')
+    .addSeparator()
+    .addItem('📊 בדוק שימוש בתאים', 'menuDiagnoseCellUsage')
+    .addItem('🗜️ דחס תאים ריקים', 'menuCompactSheets');
+
+  ui.createMenu('🚦 Waze')
+    .addItem('פתח סרגל צד...', 'showSidebar')
+    .addSeparator()
+    .addItem('📥 ייצא חדשים ל-Drive', 'menuExportArchive')
+    .addItem('🗓️ הפעל/כבה גיבוי יומי', 'menuToggleDailyArchive')
+    .addItem('🧹 קצץ raw_data עכשיו', 'menuPruneNow')
+    .addSeparator()
+    .addSubMenu(advanced)
+    .addSeparator()
     .addItem('מחק את כל הנתונים', 'clearAllData')
     .addToUi();
+
+  // Migration: remove any legacy weekly-archive triggers from before the
+  // switch to daily. Safe no-op if none exist.
+  try {
+    ScriptApp.getProjectTriggers().forEach(function(t) {
+      if (t.getHandlerFunction() === LEGACY_WEEKLY_TRIGGER_FN) {
+        ScriptApp.deleteTrigger(t);
+      }
+    });
+  } catch(_) {}
+
+  // Auto-install daily archive trigger on first open; skipped if user disabled.
+  try {
+    if (_getConfig(DAILY_ARCHIVE_CONFIG_KEY) !== 'off' && !_hasDailyArchiveTrigger()) {
+      _installDailyArchiveTrigger();
+      _setConfig(DAILY_ARCHIVE_CONFIG_KEY, 'on');
+    }
+  } catch(_) {}
+
+  // Auto-install the archive-job monitor (resumes orphaned chunked jobs).
+  try {
+    if (!_hasJobMonitorTrigger()) _installJobMonitorTrigger();
+  } catch(_) {}
 }
 
 // Manually run the next slice of a stuck archive job. Use when the auto-trigger
@@ -106,6 +179,169 @@ function menuExportArchive() {
   }
 }
 
+// Full export of raw_data — ignores the incremental high-water mark.
+// Identical to the legacy "ייצא ארכיון מלא" behavior; useful when you want a
+// complete snapshot regardless of what was archived before.
+function menuExportArchiveFull() {
+  var ui = SpreadsheetApp.getUi();
+  var r = exportFullArchiveAll();
+  if (!r.ok) { ui.alert('שגיאה', r.error, ui.ButtonSet.OK); return; }
+  if (r.done) {
+    ui.alert('הצלחה',
+      'הארכיון נשמר ל-Google Drive\n\n' +
+      'שם קובץ: ' + r.filename + '\n' +
+      'מספר פקקים: ' + r.count + '\n\n' +
+      'פתח ב: ' + r.url, ui.ButtonSet.OK);
+  } else {
+    ui.alert('בתהליך',
+      'הייצוא גדול מדי לריצה אחת — ממשיך ברקע אוטומטית.\n\n' +
+      'התקדמות: ' + r.progress.processed + ' מתוך ' + r.progress.total + '\n' +
+      'בדוק שוב בעוד מספר דקות (תיקייה: Waze Archive).', ui.ButtonSet.OK);
+  }
+}
+
+// Trigger _pruneOld immediately — archives + deletes rows older than
+// RETENTION_DAYS, plus the oldest rows if raw_data exceeds MAX_RAW_ROWS.
+// Useful when raw_data is approaching Google Sheets' cell cap.
+function menuPruneNow() {
+  var ui = SpreadsheetApp.getUi();
+  if (_getArchiveJob()) {
+    ui.alert('ייצוא כבר פעיל',
+      'יש ג\'וב ייצוא בתהליך. המתן לסיומו לפני קציצה נוספת.',
+      ui.ButtonSet.OK);
+    return;
+  }
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var raw = ss.getSheetByName(RAW_SHEET);
+  if (!raw || raw.getLastRow() < 2) {
+    ui.alert('אין מה לקצץ', 'raw_data ריק.', ui.ButtonSet.OK);
+    return;
+  }
+  var before = raw.getLastRow() - 1;
+  _pruneOld(ss);
+  var job = _getArchiveJob();
+  if (!job) {
+    ui.alert('אין שורות לקציצה',
+      'כל ' + before + ' השורות ב-raw_data בתוך טווח ה-retention (' + RETENTION_DAYS + ' ימים) ' +
+      'וגם מתחת לתקרת ' + MAX_RAW_ROWS + ' שורות. אין מה לקצץ כרגע.',
+      ui.ButtonSet.OK);
+    return;
+  }
+  ui.alert('קציצה החלה',
+    job.totalRows + ' שורות (מתוך ' + before + ') מיוצאות ל-Drive ואז יימחקו מ-raw_data.\n\n' +
+    'הריצה תמשיך אוטומטית ברקע — שם הקובץ: ' + job.filename + '\n' +
+    'אם נתקע, השתמש ב-"▶️ המשך ייצוא תקוע".',
+    ui.ButtonSet.OK);
+}
+
+// Show a per-sheet breakdown of cell usage so you can see what's eating the
+// 10M-cell budget. Highlights any sheet whose "allocated" cells (max rows ×
+// max cols, including empty trailing space) far exceed its data cells —
+// those are candidates for menuCompactSheets.
+function menuDiagnoseCellUsage() {
+  var ui = SpreadsheetApp.getUi();
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var rows = [];
+  var totalAlloc = 0, totalData = 0;
+  ss.getSheets().forEach(function(s) {
+    var maxR = s.getMaxRows(), maxC = s.getMaxColumns();
+    var lastR = s.getLastRow(), lastC = s.getLastColumn();
+    var alloc = maxR * maxC;
+    var data = lastR * lastC;
+    totalAlloc += alloc;
+    totalData += data;
+    rows.push({ name: s.getName(), alloc: alloc, data: data, maxR: maxR, lastR: lastR });
+  });
+  rows.sort(function(a, b) { return b.alloc - a.alloc; });
+
+  var lines = rows.map(function(r) {
+    var slack = r.alloc - r.data;
+    var slackPct = r.alloc > 0 ? Math.round(slack / r.alloc * 100) : 0;
+    return r.name + ': ' + r.lastR + '/' + r.maxR + ' שורות, מוקצים ' +
+      r.alloc.toLocaleString() + ' תאים' +
+      (slackPct > 30 ? ' (' + slackPct + '% ריקים — מועמד לדחיסה)' : '');
+  });
+  lines.push('');
+  lines.push('סה"כ data: ' + totalData.toLocaleString());
+  lines.push('סה"כ מוקצים: ' + totalAlloc.toLocaleString() + ' / 10,000,000');
+  lines.push('שוליים: ' + (10000000 - totalAlloc).toLocaleString());
+
+  ui.alert('שימוש בתאים בגיליון', lines.join('\n'), ui.ButtonSet.OK);
+}
+
+// Trim empty trailing rows and columns from every sheet to reclaim cells.
+// Leaves a small headroom buffer so the very next append doesn't immediately
+// force a resize. Safe — uses getLastRow/getLastColumn which only return the
+// last row/col with actual content.
+function menuCompactSheets() {
+  var ui = SpreadsheetApp.getUi();
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var reclaimed = _compactAllSheets(ss);
+  ui.alert('דחיסה הושלמה',
+    'שוחררו ' + reclaimed.toLocaleString() + ' תאים מלשוניות עם שורות/עמודות ריקות.\n\n' +
+    'הרץ "📊 בדוק שימוש בתאים" כדי לראות את המצב החדש.',
+    ui.ButtonSet.OK);
+}
+
+function _compactAllSheets(ss) {
+  var reclaimed = 0;
+  ss.getSheets().forEach(function(s) {
+    try {
+      var name = s.getName();
+      var maxR = s.getMaxRows();
+      var lastR = Math.max(1, s.getLastRow());
+      var keepRows = lastR + 100;  // buffer for next append
+      if (maxR > keepRows) {
+        var trimR = maxR - keepRows;
+        s.deleteRows(keepRows + 1, trimR);
+        reclaimed += trimR * s.getMaxColumns();
+      }
+      var maxC = s.getMaxColumns();
+      // For known-schema sheets, trust the schema constant — getLastColumn can
+      // be fooled by stray formatting/empty-string values in trailing cols,
+      // leaving phantom "buffer" cols that quietly burn 500K+ cells each.
+      var schemaC = null;
+      if (name === RAW_SHEET) schemaC = RAW_COLS.length;
+      else if (name === BASELINE_ARCHIVE) schemaC = BASELINE_COLS.length;
+      var lastC = schemaC !== null ? schemaC : Math.max(1, s.getLastColumn());
+      // For wide sheets (lots of rows), each buffer column costs `lastR` cells.
+      // Above 50K rows we drop the buffer entirely — schema additions are rare
+      // enough that auto-expand on setValues is cheaper than the standing cost.
+      var keepCols = lastR > 50000 ? lastC : lastC + 2;
+      if (maxC > keepCols) {
+        var trimC = maxC - keepCols;
+        s.deleteColumns(keepCols + 1, trimC);
+        reclaimed += trimC * s.getMaxRows();
+      }
+    } catch(e) {
+      Logger.log('Compact failed for ' + s.getName() + ': ' + e.message);
+    }
+  });
+  return reclaimed;
+}
+
+// Toggle the daily auto-archive trigger (03:00 → exportFullArchive + _pruneOld).
+function menuToggleDailyArchive() {
+  var ui = SpreadsheetApp.getUi();
+  if (_hasDailyArchiveTrigger()) {
+    _deleteDailyArchiveTrigger();
+    _setConfig(DAILY_ARCHIVE_CONFIG_KEY, 'off');
+    ui.alert('🗓️ גיבוי יומי כובה',
+      'הטריגר היומי הוסר. אפשר להפעיל שוב מאותו פריט בתפריט.',
+      ui.ButtonSet.OK);
+    return;
+  }
+  try {
+    _installDailyArchiveTrigger();
+    _setConfig(DAILY_ARCHIVE_CONFIG_KEY, 'on');
+    ui.alert('🗓️ גיבוי יומי הופעל',
+      'ייצוא אינקרמנטלי + קציצה ירוצו אוטומטית כל יום בשעה 03:00.',
+      ui.ButtonSet.OK);
+  } catch(e) {
+    ui.alert('שגיאה', 'התקנת הטריגר נכשלה: ' + e.message, ui.ButtonSet.OK);
+  }
+}
+
 function showSidebar() {
   var html = HtmlService.createHtmlOutputFromFile('Sidebar')
     .setTitle('Waze — בקרה')
@@ -137,11 +373,38 @@ function processWazeJSON(jsonString) {
   }
 
   try {
+    // Prune-first: free space (if any rows are eligible) BEFORE appending, so
+    // we don't crash against the cell cap. Idempotent — no-op if no rows match.
+    _pruneOld(ss);
     _appendToRawData(ss, jams, snapshotTs);
     _logSource(ss, snapshotTs, jams.length);
-    _pruneOld(ss);
     _rebuildAggregation(ss);
   } catch(e) {
+    // Self-healing: if we hit the cell cap, make actual progress on freeing
+    // space — start a new prune job, or if one already exists, force its
+    // continuation trigger to fire NOW (in case it was orphaned). Callers
+    // detect this via result.autoRecovering and react accordingly.
+    if (_isCellCapError(e.message)) {
+      var existingJob = _getArchiveJob();
+      var initialSource = existingJob ? existingJob.source : 'prune';
+      try {
+        if (existingJob) {
+          // Existing job — clear any stale continuation trigger and schedule
+          // a fresh one that fires in ~1 sec. Pushes the stuck job forward.
+          _deleteArchiveContinuationTriggers();
+          _scheduleArchiveContinuation();
+        } else {
+          _pruneOld(ss);
+        }
+      } catch(_) {}
+      return {
+        ok: false, autoRecovering: true,
+        initialSource: initialSource,
+        error: existingJob && existingJob.source !== 'prune'
+          ? 'ייצוא ישן בתהליך — דוחפים אותו קדימה, וכשיסיים תרוץ קציצה אוטומטית. שליפה חוזרת תרוץ בעוד 2 דקות.'
+          : 'raw_data התמלא — פינוי אוטומטי החל. תוכל לעקוב כאן אחר ההתקדמות; שליפה חוזרת תרוץ בעוד 2 דקות.',
+      };
+    }
     return { ok: false, error: e.message };
   }
 
@@ -278,6 +541,15 @@ function getStatus() {
 // ─── Fetch JSON from a URL ────────────────────
 function fetchFromUrl(url, headersJson) {
   if (!url) return { ok: false, error: 'יש להזין URL' };
+  // Persist the URL/headers so an auto-recovery retry (or any other scheduled
+  // fetch) has something to use — even if the user never explicitly clicked
+  // "שמור" on the auto-fetch panel.
+  try {
+    if (_getConfig('fetch_url') !== url) _setConfig('fetch_url', url);
+    if (headersJson && _getConfig('fetch_headers') !== headersJson) {
+      _setConfig('fetch_headers', headersJson);
+    }
+  } catch(_) {}
   var options = { muteHttpExceptions: true, followRedirects: true };
   if (headersJson && headersJson.trim()) {
     try { options.headers = JSON.parse(headersJson); }
@@ -291,7 +563,19 @@ function fetchFromUrl(url, headersJson) {
   if (code < 200 || code >= 300) {
     return { ok: false, error: 'HTTP ' + code + ': ' + resp.getContentText().substring(0, 200) };
   }
-  return processWazeJSON(resp.getContentText());
+  var result = processWazeJSON(resp.getContentText());
+  // processWazeJSON already kicked off a prune if it detected the cell cap.
+  // For the fetch path we ALSO schedule a one-shot retry, so the next attempt
+  // happens automatically once raw_data has room.
+  if (result && result.autoRecovering) {
+    var scheduled = _scheduleFetchRetry();
+    result.error = scheduled
+      ? 'raw_data התמלא — פינוי אוטומטי החל ושליפה חוזרת תרוץ בעוד דקות ספורות. אין צורך לעשות כלום.'
+      : 'raw_data התמלא ופינוי אוטומטי לא הצליח לאחר ' + FETCH_RETRY_MAX_ATTEMPTS + ' ניסיונות. הרץ "📊 בדוק שימוש בתאים" מהתפריט "מתקדם" כדי לראות מה תופס תאים, ואז "🗜️ דחס תאים ריקים" או מחק ידנית. אחרי שליפה מוצלחת המנגנון יתאפס.';
+  } else if (result && result.ok) {
+    _resetFetchRetryBudget();
+  }
+  return result;
 }
 
 // ─── Config storage in the spreadsheet itself ──
@@ -358,6 +642,9 @@ function setSchedule(url, headersJson, intervalKey) {
   _setConfig('fetch_headers', headersJson || '');
   _setConfig('fetch_interval', intervalKey || 'off');
 
+  // New schedule = explicit user intervention. Reset the self-healing retry budget
+  // so the next failure starts fresh.
+  _resetFetchRetryBudget();
   _deleteOwnTriggers();
 
   if (!intervalKey || intervalKey === 'off') {
@@ -467,6 +754,18 @@ function _ensureSourcesSheet(ss) {
 
 function _appendToRawData(ss, jams, snapshotTs) {
   var s = _ensureRawSheet(ss);
+  // Hard guard against Sheets' ~555K-row wall (10M cells / 18 cols). If we're
+  // close to it and a prune job is mid-flight, fail loudly with a friendly
+  // pointer — silently swallowing the setValues error confuses users.
+  var nCurrent = Math.max(0, s.getLastRow() - 1);
+  var hardCeiling = Math.min(540000, Math.floor(MAX_RAW_ROWS * 1.08));
+  if (nCurrent + jams.length > hardCeiling) {
+    var jobMsg = _getArchiveJob()
+      ? 'יש ייצוא+קציצה בתהליך — המתן לסיומו ונסה שוב.'
+      : 'הרץ "🧹 קצץ raw_data עכשיו" מהתפריט והמתן לסיום הייצוא.';
+    throw new Error('raw_data כמעט מלא (' + nCurrent + ' שורות, ' +
+      'תקרת Sheets ~555K). ' + jobMsg);
+  }
   var days = ['שני','שלישי','רביעי','חמישי','שישי','שבת','ראשון'];
   var jamObjsForArchive = [];
   var rows = jams.map(function(j) {
@@ -678,12 +977,25 @@ function _pruneOld(ss) {
     if (firstKeep > 0) pruneCount = firstKeep;
     else if (firstKeep === -1) pruneCount = nRows;
 
+    // Safety cap: even if all rows are within the date-retention window, prune
+    // the oldest if raw_data is approaching Google Sheets' cell limit. Brings
+    // the count down to 80% of MAX_RAW_ROWS to leave breathing room.
+    if (nRows > MAX_RAW_ROWS) {
+      var capPrune = nRows - Math.floor(MAX_RAW_ROWS * 0.8);
+      if (capPrune > pruneCount) pruneCount = capPrune;
+    }
+
     if (pruneCount > 0) {
       // Safety net: catch-up upsert any rows not yet aggregated to _baseline_archive.
       // Normally _appendToRawData has already marked them archived=true, so this is a no-op.
       _catchUpBaselineArchive(ss, raw, pruneCount);
       // Start a chunked archive job; deleteRows happens in _finalizeArchive after success.
-      _startArchiveJob(ss, raw, pruneCount, 'prune');
+      _startArchiveJob(ss, raw, 2, pruneCount, 'prune');
+    } else {
+      // No row pruning needed — but if we were called from auto-recovery, the
+      // cell cap was hit despite raw_data being under our row cap. Reclaim
+      // cells from empty trailing rows/columns in OTHER sheets as a fallback.
+      try { _compactAllSheets(ss); } catch(_) {}
     }
   }
 
@@ -761,7 +1073,7 @@ function _chunkToCSV(rows, includeHeader) {
 }
 
 function _logArchiveFile(ss, filename, url, jamCount, firstDate, lastDate) {
-  var name = 'ארכיון נפרד';
+  var name = ARCHIVE_LOG_SHEET;
   var s = ss.getSheetByName(name);
   if (!s) {
     s = ss.insertSheet(name);
@@ -784,7 +1096,39 @@ function _logArchiveFile(ss, filename, url, jamCount, firstDate, lastDate) {
   for (var c = 1; c <= 6; c++) s.autoResizeColumn(c);
 }
 
-// Manual export: dump current raw_data to Drive WITHOUT deleting from sheet.
+// Per-slice diagnostic log. One row per slice exit (budget cut-off or completion)
+// so we can see whether time budget / chunk size are tuned right. Hidden sheet.
+function _logArchiveSlice(ss, job, chunksThisSlice, elapsedMs, lastChunkMs, reason) {
+  try {
+    var name = '_archive_slice_log';
+    var s = ss.getSheetByName(name);
+    if (!s) {
+      s = ss.insertSheet(name);
+      try { s.hideSheet(); } catch(e) {}
+      s.getRange(1, 1, 1, 9).setValues([[
+        'time','filename','reason','chunks_this_slice','elapsed_ms','last_chunk_ms',
+        'processed','total','total_parts'
+      ]]).setBackground('#1F3864').setFontColor('#fff').setFontWeight('bold');
+      s.setFrozenRows(1);
+    }
+    s.appendRow([
+      new Date(),
+      job.filename,
+      reason,
+      chunksThisSlice,
+      elapsedMs,
+      lastChunkMs,
+      job.nextRow - 1,
+      job.totalRows,
+      job.partFileIds.length,
+    ]);
+  } catch(e) {
+    Logger.log('_logArchiveSlice failed: ' + e.message);
+  }
+}
+
+// Incremental export: dump only rows newer than the last archived snapshot_ts.
+// On first run (no high-water mark), falls back to a full export.
 // Returns { ok, done, ... } — when done=false a background trigger continues the job.
 function exportFullArchive() {
   var existing = _getArchiveJob();
@@ -800,7 +1144,44 @@ function exportFullArchive() {
   if (!raw || raw.getLastRow() < 2) {
     return { ok: false, error: 'אין נתונים לייצוא' };
   }
-  return _startArchiveJob(ss, raw, raw.getLastRow() - 1, 'manual');
+
+  var nRows = raw.getLastRow() - 1;
+  var lastTs = _archiveLastTs(ss);
+  if (!lastTs) {
+    // First-ever export — write everything and seed the high-water mark.
+    return _startArchiveJob(ss, raw, 2, nRows, 'manual');
+  }
+
+  var cutoffMs = lastTs.getTime();
+  var dates = raw.getRange(2, 1, nRows, 1).getValues();
+  var startOffset = -1;
+  for (var i = 0; i < dates.length; i++) {
+    var ts = dates[i][0];
+    var t = (ts instanceof Date) ? ts.getTime() : new Date(ts).getTime();
+    if (t > cutoffMs) { startOffset = i; break; }
+  }
+  if (startOffset === -1) {
+    return { ok: false, error: 'אין שורות חדשות מאז הגיבוי האחרון' };
+  }
+  return _startArchiveJob(ss, raw, startOffset + 2, nRows - startOffset, 'manual');
+}
+
+// Full re-export: ignores the high-water mark; exports all of raw_data.
+function exportFullArchiveAll() {
+  var existing = _getArchiveJob();
+  if (existing) {
+    return {
+      ok: true, done: false, inProgress: true,
+      progress: { processed: existing.nextRow - 1, total: existing.totalRows },
+      filename: existing.filename,
+    };
+  }
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var raw = ss.getSheetByName(RAW_SHEET);
+  if (!raw || raw.getLastRow() < 2) {
+    return { ok: false, error: 'אין נתונים לייצוא' };
+  }
+  return _startArchiveJob(ss, raw, 2, raw.getLastRow() - 1, 'manual');
 }
 
 function getArchiveJobStatus() {
@@ -829,23 +1210,24 @@ function getArchiveJobStatus() {
   };
 }
 
-function _startArchiveJob(ss, raw, totalRows, source) {
-  // Snapshot the date range from the rows we're about to archive (rows 2..totalRows+1).
-  var firstDate = raw.getRange(2, 1).getValue();
-  var lastDate = raw.getRange(totalRows + 1, 1).getValue();
+function _startArchiveJob(ss, raw, startSheetRow, rowCount, source) {
+  // Snapshot the date range from the rows we're about to archive.
+  var firstDate = raw.getRange(startSheetRow, 1).getValue();
+  var lastDate = raw.getRange(startSheetRow + rowCount - 1, 1).getValue();
   var fmt = function(d) { return Utilities.formatDate(new Date(d), 'Asia/Jerusalem', 'yyyy-MM-dd'); };
   var stamp = Utilities.formatDate(new Date(), 'Asia/Jerusalem', 'yyyyMMdd-HHmmss');
   var filename = 'waze-archive_' + fmt(firstDate) + '_to_' + fmt(lastDate) + '_' + stamp + '.csv';
 
   var job = {
     filename: filename,
-    totalRows: totalRows,
-    nextRow: 1,                                      // 1-indexed within data; sheet row = nextRow + 1
+    startSheetRow: startSheetRow,                    // first sheet row to read (>= 2)
+    totalRows: rowCount,                             // number of rows to export from startSheetRow
+    nextRow: 1,                                      // 1-indexed within slice; sheet row = startSheetRow + nextRow - 1
     firstDate: new Date(firstDate).toISOString(),
     lastDate: new Date(lastDate).toISOString(),
     partFileIds: [],
     source: source,                                  // 'manual' | 'prune'
-    pruneRowCount: source === 'prune' ? totalRows : 0,
+    pruneRowCount: source === 'prune' ? rowCount : 0,
   };
   _setArchiveJob(job);
   return _runArchiveSlice();
@@ -878,6 +1260,10 @@ function _runArchiveSlice() {
   }
   var folder = _archiveFolder(ss);
   var startedAt = Date.now();
+  var lastChunkMs = 0;
+  var chunksThisSlice = 0;
+  Logger.log('Archive slice start: ' + job.filename + ' — at row ' + job.nextRow + '/' + job.totalRows +
+             ' (budget ' + (ARCHIVE_TIME_BUDGET_MS / 1000) + 's, chunk ' + ARCHIVE_CHUNK_ROWS + ' rows)');
 
   while (job.nextRow <= job.totalRows) {
     // Cooperative cancel check: if the job was cleared externally
@@ -887,18 +1273,28 @@ function _runArchiveSlice() {
       Logger.log('Archive slice aborted: job was cancelled externally');
       return { ok: false, cancelled: true };
     }
-    if (Date.now() - startedAt > ARCHIVE_TIME_BUDGET_MS) {
+    // Forward-looking budget check: if the previous chunk's duration suggests
+    // the NEXT one would finish past the budget, exit now rather than starting
+    // a chunk that might run us into the 6-min Apps Script wall. On the first
+    // iteration lastChunkMs=0, so we always attempt at least one chunk.
+    var elapsed = Date.now() - startedAt;
+    if (elapsed + lastChunkMs > ARCHIVE_TIME_BUDGET_MS) {
       _setArchiveJob(job);
       _scheduleArchiveContinuation();
+      Logger.log('Archive slice budget exit: processed ' + (job.nextRow - 1) + '/' + job.totalRows +
+                 ' (' + chunksThisSlice + ' chunks this slice, elapsed ' + Math.round(elapsed / 1000) +
+                 's, lastChunkMs=' + lastChunkMs + ') — continuation scheduled');
+      _logArchiveSlice(ss, job, chunksThisSlice, elapsed, lastChunkMs, 'budget');
       return {
         ok: true, done: false,
         progress: { processed: job.nextRow - 1, total: job.totalRows },
         filename: job.filename,
       };
     }
+    var chunkStart = Date.now();
     var remaining = job.totalRows - (job.nextRow - 1);
     var size = Math.min(ARCHIVE_CHUNK_ROWS, remaining);
-    var sheetRow = job.nextRow + 1;
+    var sheetRow = (job.startSheetRow || 2) + (job.nextRow - 1);
     var rows = raw.getRange(sheetRow, 1, size, RAW_COLS.length).getValues();
     var includeHeader = (job.partFileIds.length === 0);
     var csv = _chunkToCSV(rows, includeHeader);
@@ -907,24 +1303,54 @@ function _runArchiveSlice() {
     job.partFileIds.push(partFile.getId());
     job.nextRow += size;
     _setArchiveJob(job);
+    lastChunkMs = Date.now() - chunkStart;
+    chunksThisSlice++;
+    Logger.log('Chunk ' + job.partFileIds.length + ': ' + size + ' rows in ' + lastChunkMs +
+               'ms — cumulative ' + (job.nextRow - 1) + '/' + job.totalRows);
   }
+
+  Logger.log('Archive slice done: all ' + job.totalRows + ' rows processed in ' + chunksThisSlice +
+             ' chunks this slice (total ' + job.partFileIds.length + ' chunks across all slices)');
+  _logArchiveSlice(ss, job, chunksThisSlice, Date.now() - startedAt, lastChunkMs, 'done');
 
   return _finalizeArchive(ss, folder, job);
 }
 
 function _finalizeArchive(ss, folder, job) {
-  var pieces = [];
-  for (var i = 0; i < job.partFileIds.length; i++) {
-    pieces.push(DriveApp.getFileById(job.partFileIds[i]).getBlob().getDataAsString());
-  }
-  var finalFile = folder.createFile(job.filename, pieces.join('\n'), 'text/csv');
+  var finalFile = null;
+  var keptParts = false;
 
-  for (var j = 0; j < job.partFileIds.length; j++) {
-    try { DriveApp.getFileById(job.partFileIds[j]).setTrashed(true); } catch(e) {}
+  // Try to merge parts into one file. If the merged blob would exceed Apps
+  // Script's 50 MB createFile cap (or fails for any other reason), keep the
+  // __partNNN files as-is so the export is never lost.
+  try {
+    var pieces = [];
+    for (var i = 0; i < job.partFileIds.length; i++) {
+      pieces.push(DriveApp.getFileById(job.partFileIds[i]).getBlob().getDataAsString());
+    }
+    finalFile = folder.createFile(job.filename, pieces.join('\n'), 'text/csv');
+    for (var j = 0; j < job.partFileIds.length; j++) {
+      try { DriveApp.getFileById(job.partFileIds[j]).setTrashed(true); } catch(e) {}
+    }
+  } catch(mergeErr) {
+    Logger.log('Archive merge failed, keeping parts: ' + mergeErr.message);
+    keptParts = true;
   }
 
-  _logArchiveFile(ss, job.filename, finalFile.getUrl(), job.totalRows,
+  var url, displayName;
+  if (finalFile) {
+    url = finalFile.getUrl();
+    displayName = job.filename;
+  } else {
+    url = folder.getUrl();
+    displayName = job.filename.replace(/\.csv$/, '') + ' (' + job.partFileIds.length + ' parts)';
+  }
+
+  _logArchiveFile(ss, displayName, url, job.totalRows,
     new Date(job.firstDate), new Date(job.lastDate));
+
+  // Advance the incremental high-water mark so the next export skips these rows.
+  try { _setArchiveLastTs(new Date(job.lastDate)); } catch(_) {}
 
   if (job.source === 'prune' && job.pruneRowCount > 0) {
     var raw = ss.getSheetByName(RAW_SHEET);
@@ -933,13 +1359,214 @@ function _finalizeArchive(ss, folder, job) {
 
   _clearArchiveJob();
   _deleteArchiveContinuationTriggers();
+  try { _archiveProps().deleteProperty('archiveJobLastError'); } catch(_) {}
+
+  // Auto-chain: if this was an export (not a prune) and raw_data is still
+  // over the cap, schedule a follow-up prune. Runs via a one-shot trigger so
+  // the current execution doesn't exceed its 6-min budget.
+  if (job.source !== 'prune') {
+    try {
+      var raw = ss.getSheetByName(RAW_SHEET);
+      if (raw && (raw.getLastRow() - 1) > MAX_RAW_ROWS) {
+        Logger.log('Auto-chaining prune after ' + job.source + ' archive: ' + (raw.getLastRow() - 1) + ' rows > cap');
+        // Clear any existing post-archive prune trigger first so we don't pile up.
+        ScriptApp.getProjectTriggers().forEach(function(t) {
+          if (t.getHandlerFunction() === POST_ARCHIVE_PRUNE_FN) ScriptApp.deleteTrigger(t);
+        });
+        ScriptApp.newTrigger(POST_ARCHIVE_PRUNE_FN).timeBased().after(1000).create();
+      }
+    } catch(_) {}
+  }
 
   return {
     ok: true, done: true,
     count: job.totalRows,
-    url: finalFile.getUrl(),
-    filename: job.filename,
+    url: url,
+    filename: displayName,
+    keptParts: keptParts,
+    source: job.source,
   };
+}
+
+// Triggered ~1 sec after a manual/export job completes. Starts a prune if
+// raw_data is still over the cap.
+function _postArchivePrune() {
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    if (t.getHandlerFunction() === POST_ARCHIVE_PRUNE_FN) ScriptApp.deleteTrigger(t);
+  });
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    if (_getArchiveJob()) return;  // another job started; let it run
+    _pruneOld(ss);
+  } catch(e) {
+    Logger.log('Post-archive prune failed: ' + e.message);
+  }
+}
+
+// High-water mark: ISO timestamp of the latest snapshot_ts that has been archived.
+// Used by exportFullArchive to skip rows already exported.
+function _archiveLastTs(ss) {
+  var p = _archiveProps().getProperty(ARCHIVE_LAST_TS_PROP);
+  if (p) {
+    var d = new Date(p);
+    if (!isNaN(d.getTime())) return d;
+  }
+  // Bootstrap from existing log sheet if present (max value in 'עד תאריך' column).
+  var s = ss.getSheetByName(ARCHIVE_LOG_SHEET);
+  if (!s || s.getLastRow() < 2) return null;
+  var n = s.getLastRow() - 1;
+  var col = s.getRange(2, 4, n, 1).getValues();
+  var maxMs = 0;
+  for (var i = 0; i < col.length; i++) {
+    var v = col[i][0];
+    if (!v) continue;
+    var ms;
+    if (v instanceof Date) ms = v.getTime();
+    else {
+      var m = String(v).match(/^(\d{4})-(\d{2})-(\d{2})/);
+      if (!m) continue;
+      // Treat the logged "yyyy-MM-dd" as end-of-day in Israel (+03:00 DST is
+      // worst-case; off-by-an-hour is acceptable since duplicates are harmless).
+      ms = new Date(m[1] + '-' + m[2] + '-' + m[3] + 'T23:59:59+03:00').getTime();
+    }
+    if (ms > maxMs) maxMs = ms;
+  }
+  return maxMs ? new Date(maxMs) : null;
+}
+
+function _setArchiveLastTs(d) {
+  if (!d) return;
+  var newMs = (d instanceof Date) ? d.getTime() : new Date(d).getTime();
+  if (isNaN(newMs)) return;
+  // Monotonic: never move the high-water mark backward, so a prune that
+  // archives old rows doesn't make us re-export newer ones on the next incremental.
+  var existing = _archiveProps().getProperty(ARCHIVE_LAST_TS_PROP);
+  if (existing) {
+    var existingMs = new Date(existing).getTime();
+    if (!isNaN(existingMs) && existingMs >= newMs) return;
+  }
+  _archiveProps().setProperty(ARCHIVE_LAST_TS_PROP, new Date(newMs).toISOString());
+}
+
+// ─── Daily auto-archive trigger ────────────────────────────────────
+function _hasDailyArchiveTrigger() {
+  return ScriptApp.getProjectTriggers().some(function(t) {
+    return t.getHandlerFunction() === DAILY_ARCHIVE_TRIGGER_FN;
+  });
+}
+
+function _installDailyArchiveTrigger() {
+  if (_hasDailyArchiveTrigger()) return;
+  ScriptApp.newTrigger(DAILY_ARCHIVE_TRIGGER_FN)
+    .timeBased()
+    .everyDays(1)
+    .atHour(3)
+    .create();
+}
+
+function _deleteDailyArchiveTrigger() {
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    if (t.getHandlerFunction() === DAILY_ARCHIVE_TRIGGER_FN) {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+}
+
+// Daily trigger handler: incremental export to Drive, then prune old/excess
+// rows. Both are no-ops when there's nothing to do, so it's safe to run nightly.
+// Errors are logged but never throw — next night's run will retry.
+function _dailyArchive() {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    // Export new rows first (sets the archive job if any); prune skips when a
+    // job is mid-flight, so it'll be a no-op this run if exportFullArchive
+    // started one — that's fine, prune runs again on the next daily tick.
+    exportFullArchive();
+    if (!_getArchiveJob()) _pruneOld(ss);
+  } catch(e) {
+    Logger.log('Daily archive failed: ' + e.message);
+    try {
+      _archiveProps().setProperty('archiveJobLastError',
+        new Date().toISOString() + ' — daily: ' + (e.message || String(e)));
+    } catch(_) {}
+  }
+}
+
+// ─── Archive-job watchdog ───────────────────────────────────────────
+function _hasJobMonitorTrigger() {
+  return ScriptApp.getProjectTriggers().some(function(t) {
+    return t.getHandlerFunction() === JOB_MONITOR_TRIGGER_FN;
+  });
+}
+
+function _installJobMonitorTrigger() {
+  if (_hasJobMonitorTrigger()) return;
+  ScriptApp.newTrigger(JOB_MONITOR_TRIGGER_FN)
+    .timeBased()
+    .everyHours(6)
+    .create();
+}
+
+// Resume archive jobs that lost their continuation trigger (e.g., trigger
+// quota exhaustion, a thrown error that didn't reschedule). Runs every 6h.
+function _monitorArchiveJob() {
+  var job = _getArchiveJob();
+  if (!job) return;
+  var hasContinuation = ScriptApp.getProjectTriggers().some(function(t) {
+    return t.getHandlerFunction() === ARCHIVE_TRIGGER_FN;
+  });
+  if (!hasContinuation) {
+    Logger.log('Monitor: resuming orphaned archive job ' + job.filename);
+    _scheduleArchiveContinuation();
+  }
+}
+
+// ─── Self-healing fetch ─────────────────────────────────────────────
+function _isCellCapError(msg) {
+  if (!msg) return false;
+  return /10000000 cells|cells in the workbook|raw_data כמעט מלא/.test(msg);
+}
+
+function _scheduleFetchRetry() {
+  var props = PropertiesService.getDocumentProperties();
+  var count = parseInt(props.getProperty(FETCH_RETRY_COUNT_PROP) || '0', 10);
+  // Replace any existing pending retry to coalesce repeated failures.
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    if (t.getHandlerFunction() === FETCH_RETRY_TRIGGER_FN) {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+  // If a chunked archive job is actively in flight, recovery IS making progress —
+  // skip the budget check and use the max backoff so we don't pile up retries
+  // while the archive grinds through its chunks. The 6-hour _monitorArchiveJob
+  // revives the job if it stalls.
+  var hasActiveJob = !!_getArchiveJob();
+  if (!hasActiveJob && count >= FETCH_RETRY_MAX_ATTEMPTS) {
+    return false;
+  }
+  var delay = hasActiveJob
+    ? FETCH_RETRY_BACKOFF_MS[FETCH_RETRY_BACKOFF_MS.length - 1]
+    : FETCH_RETRY_BACKOFF_MS[Math.min(count, FETCH_RETRY_BACKOFF_MS.length - 1)];
+  ScriptApp.newTrigger(FETCH_RETRY_TRIGGER_FN)
+    .timeBased()
+    .after(delay)
+    .create();
+  if (!hasActiveJob) props.setProperty(FETCH_RETRY_COUNT_PROP, String(count + 1));
+  return true;
+}
+
+function _resetFetchRetryBudget() {
+  try { PropertiesService.getDocumentProperties().deleteProperty(FETCH_RETRY_COUNT_PROP); } catch(_) {}
+}
+
+// One-shot trigger handler that retries the scheduled fetch.
+function _retryScheduledFetch() {
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    if (t.getHandlerFunction() === FETCH_RETRY_TRIGGER_FN) {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+  _scheduledFetch();
 }
 
 function _countSnapshots(ss) {

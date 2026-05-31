@@ -123,10 +123,13 @@
   <hr style="margin:18px 0 12px;border:none;border-top:1px solid #e2e8f0">
   <label>💾 ארכיון ארוך-טווח</label>
   <div style="font-size:11px;color:#64748b;line-height:1.6;margin-bottom:8px">
-    נתונים מעל 30 יום נשמרים אוטומטית כקבצי CSV ב-Google Drive (תיקייה: <strong>Waze Archive</strong>) ומופיעים בלשונית <strong>ארכיון נפרד</strong> בגיליון.
+    נתונים מעל 30 יום נשמרים אוטומטית כקבצי CSV ב-Google Drive (תיקייה: <strong>Waze Archive</strong>) ומופיעים בלשונית <strong>ארכיון נפרד</strong>. גיבוי יומי אינקרמנטלי + קציצה רצים אוטומטית ב-03:00. אפשר גם להריץ ידנית — "חדשים" מייצא רק שורות מאז הגיבוי האחרון; "הכל" מייצא הכל מהתחלה.
   </div>
-  <button class="btn secondary" onclick="doExportArchive()" style="margin-top:0">
+  <button class="btn secondary" onclick="doExportArchiveAll()" style="margin-top:0">
     📤 ייצא הכל ל-Drive עכשיו
+  </button>
+  <button class="btn secondary" onclick="doExportArchive()" style="margin-top:6px">
+    📤 ייצא חדשים ל-Drive עכשיו
   </button>
   <div class="status" id="exportStatus"></div>
 </div>
@@ -246,6 +249,9 @@
             '\nסה"כ דגימות: ' + r.totalSnapshots,
             'success');
           loadStatus();
+        } else if (r.autoRecovering) {
+          showStatus('uploadStatus', '🧹 ' + r.error, 'loading');
+          startArchivePolling('uploadStatus', 'מקצץ', r.initialSource);
         } else {
           showStatus('uploadStatus', '❌ ' + r.error, 'error');
         }
@@ -291,6 +297,9 @@
           loadStatus();
         } else if (r.duplicate) {
           showStatus('autoStatus', '⚠️ ' + r.error, 'error');
+        } else if (r.autoRecovering) {
+          showStatus('autoStatus', '🧹 ' + r.error, 'loading');
+          startArchivePolling('autoStatus', 'מקצץ', r.initialSource);
         } else {
           showStatus('autoStatus', '❌ ' + r.error, 'error');
         }
@@ -380,7 +389,10 @@
 
   var archivePollTimer = null;
 
-  function doExportArchive() {
+  function doExportArchive()    { _runExport('exportFullArchive'); }
+  function doExportArchiveAll() { _runExport('exportFullArchiveAll'); }
+
+  function _runExport(fnName) {
     if (archivePollTimer) { clearInterval(archivePollTimer); archivePollTimer = null; }
     showStatus('exportStatus', 'מייצא ל-Drive... ⏳', 'loading');
     google.script.run
@@ -394,31 +406,59 @@
         showStatus('exportStatus',
           '⏳ מייצא ברקע... ' + r.progress.processed + ' / ' + r.progress.total +
           '\n(הריצה תמשיך אוטומטית)', 'loading');
-        startArchivePolling();
+        startArchivePolling('exportStatus', 'מייצא');
       })
       .withFailureHandler(function(err) {
         showStatus('exportStatus', '❌ ' + err.message, 'error');
       })
-      .exportFullArchive();
+      [fnName]();
   }
 
-  function startArchivePolling() {
+  function startArchivePolling(statusId, verb, initialSource) {
+    statusId = statusId || 'exportStatus';
+    verb = verb || 'מייצא';
     if (archivePollTimer) clearInterval(archivePollTimer);
+    // Track the source so we can show an accurate completion message even if
+    // the job finishes between polls. Also track an idle-poll counter so we
+    // keep polling briefly after a job goes inactive — that catches the
+    // auto-chained prune that fires ~1 sec after a manual export completes.
+    var seenSource = initialSource || null;
+    var idleTicks = 0;
+    var MAX_IDLE_TICKS = 2;  // keep polling for ~10 sec after the last seen job
     archivePollTimer = setInterval(function() {
       google.script.run
         .withSuccessHandler(function(s) {
-          if (!s.active) {
-            clearInterval(archivePollTimer); archivePollTimer = null;
-            showStatus('exportStatus', '✅ נשמר ב-Drive\nקובץ: ' + (s.filename || ''), 'success');
+          if (s.active) {
+            if (s.source) seenSource = s.source;
+            idleTicks = 0;
+            var label = (seenSource === 'prune') ? 'מקצץ' : verb;
+            showStatus(statusId,
+              '⏳ ' + label + ' ברקע... ' + s.processed + ' / ' + s.total +
+              (s.parts ? ' (' + s.parts + ' קבצים נכתבו)' : '') +
+              '\n(הריצה תמשיך אוטומטית)', 'loading');
             return;
           }
-          showStatus('exportStatus',
-            '⏳ מייצא ברקע... ' + s.processed + ' / ' + s.total +
-            '\n(הריצה תמשיך אוטומטית)', 'loading');
+          // No active job. Give it a couple of ticks in case a follow-up
+          // (auto-chained prune) is about to start.
+          idleTicks++;
+          if (idleTicks < MAX_IDLE_TICKS) {
+            showStatus(statusId, '⏳ ממתין להמשך...', 'loading');
+            return;
+          }
+          clearInterval(archivePollTimer); archivePollTimer = null;
+          var doneLabel;
+          if (seenSource === 'prune') {
+            doneLabel = '✅ הקציצה הושלמה — raw_data פנוי לשליפות נוספות.\nשליפה חוזרת תרוץ אוטומטית בעוד דקה.';
+          } else if (seenSource === 'manual') {
+            doneLabel = '✅ הייצוא הושלם.\nאם raw_data עדיין מלא — קציצה תתחיל אוטומטית בקרוב.';
+          } else {
+            doneLabel = '✅ הג\'וב הסתיים.';
+          }
+          showStatus(statusId, doneLabel, 'success');
         })
         .withFailureHandler(function(err) {
           clearInterval(archivePollTimer); archivePollTimer = null;
-          showStatus('exportStatus', '❌ ' + err.message, 'error');
+          showStatus(statusId, '❌ ' + err.message, 'error');
         })
         .getArchiveJobStatus();
     }, 5000);
