@@ -18,6 +18,24 @@ var RETENTION_DAYS = 30;
 // At 20 cols/row: 450K × 20 = 9M cells, leaving ~1M cells of headroom.
 var MAX_RAW_ROWS = 450000;
 
+// ─── National Traffic Index (NCI) ─────────────
+// One national number per rush window = jam-weighted average of the per-route
+// "deviation %" (current avg-delay-per-jam vs the permanent _baseline_archive),
+// with hours bucketed into the windows below. + = heavier than routine, − = lighter.
+var NCI_WINDOWS = [
+  { key: 'בוקר', hours: [6, 7, 8, 9], runAtHour: 10 },   // 06:00–10:00 → run ~10:00
+  { key: 'ערב',  hours: [16, 17, 18], runAtHour: 20 },   // 16:00–19:00 → run ~20:00
+];
+var NCI_SHEET           = '🚦 מדד ארצי';
+var NCI_TIMEFRAME_SHEET = 'פירוט לפי מסגרת זמן';
+var NCI_HISTORY_SHEET   = '_nci_history';   // hidden, permanent — survives the 30-day prune
+var NCI_HISTORY_COLS    = ['run_ts','date','window','daytype','index_pct','n_jams','n_routes'];
+var NCI_TRIGGER_FN      = '_scheduledNCI';
+var NCI_TREND_POINTS    = 14;   // how many recent readings the slide's trend shows
+var NCI_EMAIL_CONFIG_KEY = 'nci_email';      // 'on' (default) | 'off' — email the index after each run
+var NCI_EMAIL_TO_KEY     = 'nci_email_to';   // comma/semicolon-separated recipients; blank = sheet owner
+var NCI_EMAIL_TREND      = 7;   // recent same-window readings shown in the email trend
+
 // Resumable archive job: bounded work per execution, resumed via time trigger.
 // Smaller chunks + tighter budget = more frequent checkpoints and a safer exit
 // well before Apps Script's 6-min wall. A single chunk includes a Drive.createFile
@@ -65,7 +83,8 @@ function onOpen() {
     .addItem('🔄 העבר נתונים קיימים לארכיון אגרגטיבי', 'menuMigrateToArchive')
     .addSeparator()
     .addItem('📊 בדוק שימוש בתאים', 'menuDiagnoseCellUsage')
-    .addItem('🗜️ דחס תאים ריקים', 'menuCompactSheets');
+    .addItem('🗜️ דחס תאים ריקים', 'menuCompactSheets')
+    .addItem('🔃 תקן סדר raw_data (לפי זמן)', 'menuRepairRawDataOrder');
 
   ui.createMenu('🚦 Waze')
     .addItem('פתח סרגל צד...', 'showSidebar')
@@ -73,6 +92,12 @@ function onOpen() {
     .addItem('📥 ייצא חדשים ל-Drive', 'menuExportArchive')
     .addItem('🗓️ הפעל/כבה גיבוי יומי', 'menuToggleDailyArchive')
     .addItem('🧹 קצץ raw_data עכשיו', 'menuPruneNow')
+    .addSeparator()
+    .addItem('🚦 חשב מדד ארצי עכשיו', 'menuRunNCINow')
+    .addItem('⏰ התקן תזמון מדד ארצי (בוקר+ערב)', 'menuInstallNCITriggers')
+    .addItem('📧 הפעל/כבה מייל מדד ארצי', 'menuToggleNCIEmail')
+    .addItem('✉️ הגדר נמעני מייל מדד...', 'menuSetNCIEmailRecipients')
+    .addItem('📤 שלח מייל מדד עכשיו (בדיקה)', 'menuSendNCIEmailTest')
     .addSeparator()
     .addSubMenu(advanced)
     .addSeparator()
@@ -94,6 +119,14 @@ function onOpen() {
     if (_getConfig(DAILY_ARCHIVE_CONFIG_KEY) !== 'off' && !_hasDailyArchiveTrigger()) {
       _installDailyArchiveTrigger();
       _setConfig(DAILY_ARCHIVE_CONFIG_KEY, 'on');
+    }
+  } catch(_) {}
+
+  // Auto-install the national-index triggers (morning+evening); skipped if disabled.
+  try {
+    if (_getConfig('nci_schedule') !== 'off' && !_hasNCITrigger()) {
+      installNCITriggers();
+      _setConfig('nci_schedule', 'on');
     }
   } catch(_) {}
 
@@ -244,6 +277,40 @@ function menuPruneNow() {
     'הריצה תמשיך אוטומטית ברקע — שם הקובץ: ' + job.filename + '\n' +
     'אם נתקע, השתמש ב-"▶️ המשך ייצוא תקוע".',
     ui.ButtonSet.OK);
+}
+
+// Restore raw_data to chronological order (oldest → newest) by sorting on
+// snapshot_ts. The whole pipeline assumes new rows are appended at the bottom,
+// so a manual column sort (or any reordering) silently breaks the index and the
+// prune boundary. This re-establishes the invariant in one pass.
+function menuRepairRawDataOrder() {
+  var ui = SpreadsheetApp.getUi();
+  if (_getArchiveJob()) {
+    ui.alert('ייצוא פעיל', 'יש ג\'וב ייצוא/קציצה בתהליך. המתן לסיומו ואז נסה שוב.', ui.ButtonSet.OK);
+    return;
+  }
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var raw = ss.getSheetByName(RAW_SHEET);
+  if (!raw || raw.getLastRow() < 3) {
+    ui.alert('אין מה לתקן', 'raw_data ריק או קצר מדי.', ui.ButtonSet.OK);
+    return;
+  }
+  var n = raw.getLastRow() - 1;
+  var resp = ui.alert('תיקון סדר raw_data',
+    'ימוין מחדש ' + n + ' שורות לפי זמן (snapshot_ts) בסדר עולה, כך שהנתון החדש ביותר חוזר לתחתית.\n\n' +
+    'הנתונים עצמם לא משתנים — רק הסדר. להמשיך?',
+    ui.ButtonSet.YES_NO);
+  if (resp !== ui.Button.YES) return;
+  try {
+    // Sort the data range (excluding the header) by column 1 ascending.
+    raw.getRange(2, 1, n, RAW_COLS.length).sort({ column: 1, ascending: true });
+    var last = _ymd(raw.getRange(raw.getLastRow(), 3).getValue());
+    ui.alert('הסדר תוקן', 'raw_data מוין לפי זמן. התאריך האחרון כעת: ' + last +
+      '\n\nכעת הרץ "🚦 חשב מדד ארצי עכשיו" כדי לרענן את המדד.', ui.ButtonSet.OK);
+  } catch (e) {
+    ui.alert('התיקון נכשל', e.message +
+      '\n\nאפשר גם למיין ידנית: בחר את raw_data ← נתונים ← מיון טווח ← לפי עמודה A, עולה.', ui.ButtonSet.OK);
+  }
 }
 
 // Show a per-sheet breakdown of cell usage so you can see what's eating the
@@ -459,6 +526,16 @@ function applyFilter(filter) {
     _sheet4_anomalies(ss, raw);
     _sheet5_detail(ss, raw);
     _sheet6_legend(ss);
+    // National index tabs — filter-independent (latest complete window vs the
+    // permanent baseline). Rendered here too so they refresh on every manual rebuild.
+    // Isolated in its own try so a failure here can't break the core filter flow.
+    try {
+      var nci = _nciData(ss, baselines);
+      if (nci) {
+        _sheetTimeframes(ss, nci, baselines);
+        _sheetNCI(ss, nci, _readNCIHistory(ss, NCI_TREND_POINTS));
+      }
+    } catch (nciErr) {}
     ss.getSheetByName('🎯 לוח מחוונים').activate();
     var arch = ss.getSheetByName(BASELINE_ARCHIVE);
     var archiveCells = arch && arch.getLastRow() > 1 ? arch.getLastRow() - 1 : 0;
@@ -1815,6 +1892,545 @@ function _filterLabel(filter) {
 }
 
 // ─── Sheet 0: Dashboard (one-pager TL;DR) ─────
+// ═══ NATIONAL TRAFFIC INDEX (NCI) ═════════════════════════════════
+// Reuses the exact comparison logic of "פירוט לפי שעה" (current avg-delay-per-jam
+// vs the permanent _baseline_archive) but buckets hours into NCI_WINDOWS, and
+// collapses each window into one jam-weighted national "deviation %" number.
+
+// Normalize a raw date cell to 'yyyy-MM-dd' whether it's stored as a string or a Date.
+function _ymd(v) {
+  if (v instanceof Date) return Utilities.formatDate(v, 'Asia/Jerusalem', 'yyyy-MM-dd');
+  return ('' + v).slice(0, 10);
+}
+// Retry wrapper for transient "Service Spreadsheets timed out" errors on big docs.
+function _retry(fn, tries) {
+  tries = tries || 3;
+  for (var i = 0; i < tries; i++) {
+    try { return fn(); }
+    catch (e) {
+      if (i === tries - 1) throw e;
+      Utilities.sleep(1500 * (i + 1));
+    }
+  }
+}
+function _nciFmtPct(p) {
+  if (p == null) return '—';
+  return (p >= 0 ? '+' : '') + _round1(p) + '%';
+}
+function _winRangeLabel(key) {
+  for (var i = 0; i < NCI_WINDOWS.length; i++) {
+    if (NCI_WINDOWS[i].key === key) {
+      var h = NCI_WINDOWS[i].hours;
+      return _pad(h[0]) + ':00–' + _pad(h[h.length - 1] + 1) + ':00';
+    }
+  }
+  return key;
+}
+// Deviation% → { label (status word), head (slide headline), bg, fg }
+function _nciStatus(dev) {
+  if (dev == null)  return { label: 'אין נתונים',  head: 'אין מספיק נתונים',        bg: '#F1F5F9', fg: '#475569' };
+  if (dev > 50)     return { label: 'חריג מאוד',    head: 'תנועה כבדה מאוד מהרגיל',  bg: C_RED_BG,  fg: C_RED_FG };
+  if (dev > 25)     return { label: 'עמוס',         head: 'תנועה כבדה מהרגיל',        bg: C_ORG_BG,  fg: C_ORG_FG };
+  if (dev > 10)     return { label: 'מתון',         head: 'כבד מעט מהרגיל',           bg: C_YEL_BG,  fg: C_YEL_FG };
+  if (dev >= -10)   return { label: 'תקין',         head: 'תואם שגרה',                bg: C_GRN_BG,  fg: C_GRN_FG };
+  return                   { label: 'טוב מהרגיל',   head: 'קל מהרגיל',                bg: '#DBEAFE', fg: '#1E40AF' };
+}
+
+// Core: read the latest date's window jams (filter-independent), compute the
+// per-route deviation and the jam-weighted national index per window.
+function _nciData(ss, baselines) {
+  var s = ss.getSheetByName(RAW_SHEET);
+  if (!s || s.getLastRow() < 2) return null;
+  var n = s.getLastRow() - 1;
+  // Normally the latest date's rows live at the bottom, so reading the tail avoids
+  // a full scan. But raw_data can fall out of chronological order (e.g. a manual
+  // column sort), which would strand an old row at the bottom. So don't trust the
+  // last physical row — scan the read window for the MAX date and use that.
+  var readN = Math.min(n, 30000);
+  var values = _retry(function() {
+    return s.getRange(2 + (n - readN), 1, readN, RAW_COLS.length).getValues();
+  });
+
+  var date = '', dayName = '';
+  for (var di = 0; di < readN; di++) {
+    var d = _ymd(values[di][2]);
+    if (d > date) { date = d; dayName = values[di][3]; }
+  }
+  var daytype = _dayType(dayName);
+
+  var winByHour = {};
+  NCI_WINDOWS.forEach(function(w) { w.hours.forEach(function(h) { winByHour[h] = w.key; }); });
+
+  var routeMeta = {};
+  ROUTES.forEach(function(rt) {
+    routeMeta[rt.name + '::1'] = { section: rt.section, route: rt.name, dir: rt.dir1_label, dirIx: 1 };
+    if (rt.dir2_label) routeMeta[rt.name + '::2'] = { section: rt.section, route: rt.name, dir: rt.dir2_label, dirIx: 2 };
+  });
+
+  var groups = {};   // window → routeKey → { meta, hours: { hour: {jams, sumDelay} } }
+  for (var i = 0; i < readN; i++) {
+    var r = values[i];
+    if (_ymd(r[2]) !== date) continue;
+    var wk = winByHour[r[4]];
+    if (!wk) continue;
+    var routeName = r[15] || '';
+    if (!routeName) continue;
+    var meta = routeMeta[routeName + '::' + r[16]];
+    if (!meta) continue;
+    var g = groups[wk] || (groups[wk] = {});
+    var cell = g[routeName + '::' + r[16]] || (g[routeName + '::' + r[16]] = { meta: meta, hours: {} });
+    var hh = cell.hours[r[4]] || (cell.hours[r[4]] = { jams: 0, sumDelay: 0 });
+    hh.jams++;
+    hh.sumDelay += (+r[10] || 0);
+  }
+
+  // National index = jam-weighted average of the per-HOUR "deviation %" values
+  // (identical to "פירוט לפי שעה", via avgPerJamAtHour), bucketed into the window.
+  var windows = {}, order = [];
+  NCI_WINDOWS.forEach(function(w) {
+    var g = groups[w.key];
+    if (!g) return;
+    var rows = [], totDevNum = 0, totDevJams = 0, contribCells = 0, totJams = 0;
+    Object.keys(g).forEach(function(rk) {
+      var cell = g[rk];
+      var rDevNum = 0, rDevJams = 0, rJams = 0, srcCounts = {};
+      Object.keys(cell.hours).forEach(function(hk) {
+        var o = cell.hours[hk];
+        rJams += o.jams;
+        var base = baselines && baselines.avgPerJamAtHour(cell.meta.route, cell.meta.dirIx, parseInt(hk, 10), daytype);
+        if (base && base.avg > 0) {
+          var dev = (o.sumDelay / o.jams - base.avg) / base.avg * 100;
+          rDevNum += dev * o.jams; rDevJams += o.jams;
+          srcCounts[base.source] = (srcCounts[base.source] || 0) + o.jams;
+        }
+      });
+      var rDev = rDevJams > 0 ? _round1(rDevNum / rDevJams) : null;
+      var src = '—', bestN = 0;
+      Object.keys(srcCounts).forEach(function(s) { if (srcCounts[s] > bestN) { src = s; bestN = srcCounts[s]; } });
+      rows.push({
+        section: cell.meta.section, route: cell.meta.route, dir: cell.meta.dir,
+        jams: rJams, devPct: rDev, source: rDev != null ? src : '—',
+      });
+      if (rDev != null) { totDevNum += rDevNum; totDevJams += rDevJams; contribCells++; }
+      totJams += rJams;
+    });
+    rows.sort(function(a, b) {
+      var x = a.devPct == null ? -1e9 : a.devPct, y = b.devPct == null ? -1e9 : b.devPct;
+      return y - x;
+    });
+    windows[w.key] = {
+      key: w.key, hours: w.hours, rows: rows,
+      indexPct: totDevJams > 0 ? _round1(totDevNum / totDevJams) : null,
+      nJams: totJams, nRoutes: contribCells,
+    };
+    order.push(w.key);
+  });
+
+  return {
+    date: date, dayName: dayName, daytype: daytype,
+    windows: windows, order: order,
+    headline: order.length ? windows[order[order.length - 1]] : null,
+  };
+}
+
+// ─── _nci_history (permanent log of every reading) ───
+function _ensureNCIHistory(ss) {
+  var s = ss.getSheetByName(NCI_HISTORY_SHEET);
+  if (!s) {
+    s = ss.insertSheet(NCI_HISTORY_SHEET);
+    try { s.hideSheet(); } catch(e) {}
+    s.getRange(1, 1, 1, NCI_HISTORY_COLS.length).setValues([NCI_HISTORY_COLS])
+     .setBackground('#1F3864').setFontColor('#fff').setFontWeight('bold');
+    s.setFrozenRows(1);
+  }
+  // Self-heal: pin the numeric columns to number formats. appendRow can inherit a
+  // stray date format, and a date-formatted numeric cell makes getValues() return a
+  // Date object — which surfaced as nonsense "1901-…" jam counts in the trend table.
+  // Re-applying a number format reinterprets the stored serial as the original integer.
+  var last = s.getLastRow();
+  if (last >= 1) {
+    s.getRange(1, 5, last, 1).setNumberFormat('0.0');  // index_pct
+    s.getRange(1, 6, last, 2).setNumberFormat('0');     // n_jams, n_routes
+  }
+  return s;
+}
+function _appendNCIHistory(ss, win, date, daytype) {
+  var s = _ensureNCIHistory(ss);
+  var n = s.getLastRow() - 1;
+  if (n > 0) {   // dedup: one row per (date, window)
+    var keys = s.getRange(2, 2, n, 2).getValues();
+    for (var i = 0; i < keys.length; i++) {
+      if (_ymd(keys[i][0]) === date && keys[i][1] === win.key) return false;
+    }
+  }
+  s.appendRow([new Date(), date, win.key, daytype, win.indexPct, win.nJams, win.nRoutes]);
+  return true;
+}
+function _readNCIHistory(ss, limit) {
+  var s = _ensureNCIHistory(ss);     // also repairs any date-formatted numeric cells
+  if (s.getLastRow() < 2) return [];
+  SpreadsheetApp.flush();            // commit the format repair before reading values
+  var n = s.getLastRow() - 1;
+  var start = Math.max(0, n - limit);
+  return s.getRange(2 + start, 1, n - start, NCI_HISTORY_COLS.length).getValues().map(function(r) {
+    return { run_ts: r[0], date: r[1], window: r[2], daytype: r[3],
+             index_pct: Number(r[4]), n_jams: Number(r[5]), n_routes: Number(r[6]) };
+  });
+}
+
+// ─── Tab: פירוט לפי מסגרת זמן (window-level detail that feeds the index) ───
+function _sheetTimeframes(ss, nci, baselines) {
+  var ws = _newSheet(ss, NCI_TIMEFRAME_SHEET, '#2E75B6');
+  var cols = ['אזור','מסלול','כיוון','מסגרת זמן','סוג יום','מס\' פקקים','סטייה %','מקור השוואה','סטטוס'];
+  _tabIntro(ws, cols.length, 'אותה השוואה כמו "פירוט לפי שעה", אך השעות מקובצות למסגרות (בוקר 06–10 / ערב 16–19). "מדד התנועה הארצי" = הממוצע המשוקלל לפי מס\' פקקים של עמודת "סטייה %" בכל מסגרת. חיובי = כבד מהשגרה, שלילי = קל. השוואה מול _baseline_archive (כל ההיסטוריה).', 1);
+  _hdrRow(ws, cols, 2);
+  var row = 3;
+  var dtLabel = nci.daytype === 'weekend' ? 'סופ"ש' : 'חול';
+  nci.order.forEach(function(wk) {
+    var win = nci.windows[wk];
+    var st = _nciStatus(win.indexPct);
+    ws.getRange(row, 1, 1, cols.length).merge()
+      .setValue('🚦 מסגרת ' + wk + ' (' + _winRangeLabel(wk) + ')  ·  מדד ארצי משוקלל: ' +
+                _nciFmtPct(win.indexPct) + '  ·  ' + st.label + '  ·  ' + win.nJams + ' פקקים, ' + win.nRoutes + ' מסלולים')
+      .setBackground(C_SEC_BG).setFontColor(C_SEC_FG).setFontWeight('bold').setHorizontalAlignment('right');
+    row++;
+    win.rows.forEach(function(rw) {
+      var rst = _nciStatus(rw.devPct);
+      _dataRow(ws, row, [rw.section, rw.route, rw.dir, wk, dtLabel, rw.jams,
+                         rw.devPct != null ? _nciFmtPct(rw.devPct) : '—', rw.source, rst.label],
+               row % 2 === 0);
+      if (rw.devPct != null) _colorDeviation(ws, row, 7, rw.devPct);
+      _colorStatus(ws, row, 9, rst.label);
+      row++;
+    });
+  });
+  if (!nci.order.length) {
+    ws.getRange(3, 1, 1, cols.length).merge()
+      .setValue('אין עדיין נתונים בחלונות הבוקר/ערב בתאריך ' + nci.date + '.')
+      .setHorizontalAlignment('center').setFontColor('#475569');
+  }
+  _autoWidth(ws, cols.length);
+  ws.setFrozenRows(2);
+}
+
+// ─── Tab: 🚦 מדד ארצי (the slide) ───
+function _sheetNCI(ss, nci, history) {
+  var ws = _newSheet(ss, NCI_SHEET, '#C00000');
+  var nc = 6;
+  var head = nci.headline;
+  var hasVal = head && head.indexPct != null;
+  var st = _nciStatus(hasVal ? head.indexPct : null);
+  var dtLabel = nci.daytype === 'weekend' ? 'סופ"ש' : 'חול';
+
+  ws.getRange(1, 1, 1, nc).merge().setValue('🚦 מדד התנועה הארצי — סטייה מהשגרה')
+    .setFontSize(20).setFontWeight('bold').setFontColor('#FFFFFF').setBackground('#1F3864')
+    .setHorizontalAlignment('center').setVerticalAlignment('middle');
+  ws.setRowHeight(1, 46);
+
+  var winLbl = head ? (head.key + ' ' + _winRangeLabel(head.key)) : '—';
+  ws.getRange(2, 1, 1, nc).merge()
+    .setValue('תאריך ' + nci.date + '   •   חלון ' + winLbl + '   •   ' + dtLabel +
+              '   •   עודכן ' + Utilities.formatDate(new Date(), 'Asia/Jerusalem', 'dd/MM HH:mm'))
+    .setFontSize(11).setFontColor('#475569').setBackground('#F1F5F9').setHorizontalAlignment('center');
+
+  _tabIntro(ws, nc, 'מספר אחד למצב התנועה הארצי: הממוצע המשוקלל (לפי מס\' פקקים) של "סטייה %" מול ה-baseline ההיסטורי, למסגרת הזמן שזה עתה נסגרה. חיובי = כבד מהשגרה · שלילי = קל מהשגרה. מתעדכן אוטומטית בוקר וערב. פירוט מלא בלשונית "פירוט לפי מסגרת זמן".', 3);
+
+  ws.getRange(4, 1, 3, nc).merge().setValue(hasVal ? _nciFmtPct(head.indexPct) : 'אין נתונים')
+    .setFontSize(58).setFontWeight('bold').setFontColor(st.fg).setBackground(st.bg)
+    .setHorizontalAlignment('center').setVerticalAlignment('middle');
+  ws.setRowHeight(4, 38); ws.setRowHeight(5, 38); ws.setRowHeight(6, 38);
+
+  ws.getRange(7, 1, 1, nc).merge().setValue(st.head)
+    .setFontSize(22).setFontWeight('bold').setFontColor(st.fg).setBackground(st.bg)
+    .setHorizontalAlignment('center');
+  ws.setRowHeight(7, 36);
+
+  var sub = hasVal
+    ? ('העומס הארצי ' + (head.indexPct >= 0 ? 'גבוה' : 'נמוך') + ' ב-' + Math.abs(_round1(head.indexPct)) +
+       '% משגרת ' + head.key + '־' + (dtLabel === 'חול' ? 'חול' : 'סופ"ש') +
+       '   ·   ' + head.nRoutes + ' מסלולים   ·   ' + head.nJams + ' פקקים')
+    : 'אין עדיין נתונים לחלון הנוכחי בתאריך ' + nci.date + '.';
+  ws.getRange(8, 1, 1, nc).merge().setValue(sub).setFontSize(11).setFontColor('#475569').setHorizontalAlignment('center');
+
+  var row = 10;
+  _secRow(ws, row, nc, 'מדד לפי חלון — ' + nci.date); row++;
+  _hdrRow(ws, ['חלון','טווח','מדד %','מס\' פקקים','מסלולים','סטטוס'], row); row++;
+  nci.order.forEach(function(wk) {
+    var w = nci.windows[wk];
+    _dataRow(ws, row, [wk, _winRangeLabel(wk), _nciFmtPct(w.indexPct), w.nJams, w.nRoutes, _nciStatus(w.indexPct).label], row % 2 === 0);
+    _colorDeviation(ws, row, 3, w.indexPct);
+    row++;
+  });
+
+  row++;
+  _secRow(ws, row, nc, 'מגמת ' + history.length + ' קריאות אחרונות   ·   גבוה = כבד מהשגרה'); row++;
+  _hdrRow(ws, ['תאריך','חלון','סוג יום','מדד %','פקקים','‎'], row); row++;
+  var trendStart = row;
+  history.forEach(function(h) {
+    _dataRow(ws, row, [_ymd(h.date), h.window, (h.daytype === 'weekend' ? 'סופ"ש' : 'חול'), '', h.n_jams, ''], row % 2 === 0);
+    ws.getRange(row, 4).setValue(_round1(h.index_pct))
+      .setNumberFormat('+0.0"%";-0.0"%";0"%"').setHorizontalAlignment('center').setFontWeight('bold');
+    _colorDeviation(ws, row, 4, h.index_pct);
+    row++;
+  });
+  var trendEnd = row - 1;
+  // Pin the jams column to an integer format so a value never renders as a date.
+  if (history.length) ws.getRange(trendStart, 5, history.length, 1).setNumberFormat('0');
+
+  if (history.length > 0) {
+    ws.getRange(row, 1, 1, nc).merge()
+      .setFormula('=SPARKLINE(D' + trendStart + ':D' + trendEnd +
+        ',{"charttype","column";"color","#C00000";"negcolor","#1E40AF";"axis",true;"axiscolor","#94A3B8"})');
+    ws.setRowHeight(row, 64);
+    row++;
+  }
+
+  row++;
+  ws.getRange(row, 1, 1, nc).merge()
+    .setValue('מתודולוגיה: ממוצע משוקלל (לפי מס\' פקקים) של סטיית ההשהיה-לפקק מול _baseline_archive (כל ההיסטוריה), לפי מסגרות זמן. תזמון אוטומטי: ' +
+              NCI_WINDOWS[0].runAtHour + ':00 ו-' + NCI_WINDOWS[1].runAtHour + ':00.')
+    .setFontSize(9).setFontStyle('italic').setFontColor('#94A3B8').setHorizontalAlignment('right').setWrap(true);
+  ws.setRowHeight(row, 30);
+
+  for (var c = 1; c <= nc; c++) ws.setColumnWidth(c, 128);
+  try { ss.setActiveSheet(ws); ss.moveActiveSheet(2); } catch(e) {}
+}
+
+// ─── Scheduled run (morning ~10:00 / evening ~20:00) ───
+function _scheduledNCI() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var step = 'התחלה';
+  try {
+    step = 'קריאת בייסליין מ-_baseline_archive';
+    var baselines = _retry(function() { return _computeBaselines(ss); });
+    step = 'קריאת raw_data';
+    var nci = _retry(function() { return _nciData(ss, baselines); });
+    if (!nci) return;
+    step = 'רישום היסטוריה';
+    var nowH = parseInt(Utilities.formatDate(new Date(), 'Asia/Jerusalem', 'H'), 10);
+    var key = nowH < 13 ? 'בוקר' : 'ערב';
+    var win = nci.windows[key];
+    if (win && win.indexPct != null) _appendNCIHistory(ss, win, nci.date, nci.daytype);
+    var history = _readNCIHistory(ss, NCI_TREND_POINTS);
+    step = 'בניית לשונית "פירוט לפי מסגרת זמן"';
+    _sheetTimeframes(ss, nci, baselines);
+    step = 'בניית לשונית "מדד ארצי"';
+    _sheetNCI(ss, nci, history);
+    step = 'שליחת מייל מדד ארצי';
+    try { _sendNCIEmail(nci, win, history); } catch (mailErr) {
+      // A mail failure must never abort the index run or its sheets.
+      try { console.error('NCI email failed: ' + mailErr.message); } catch (_) {}
+    }
+  } catch (e) {
+    // Don't hard-block on the mere existence of a job record (it persists while
+    // idle/orphaned). Only surface it as a hint if the run actually failed.
+    var hint = '';
+    try { if (_getArchiveJob()) hint = '\n\n(ייתכן שעבודת ארכוב פעילה ברקע נועלת את המסמך — המתן דקה ונסה שוב, או סיים אותה דרך מתקדם ← "▶️ המשך ייצוא תקוע".)'; } catch (_) {}
+    throw new Error('נכשל בשלב [' + step + ']: ' + e.message + hint);
+  }
+}
+function _hasNCITrigger() {
+  return ScriptApp.getProjectTriggers().some(function(t) { return t.getHandlerFunction() === NCI_TRIGGER_FN; });
+}
+function installNCITriggers() {
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    if (t.getHandlerFunction() === NCI_TRIGGER_FN) ScriptApp.deleteTrigger(t);
+  });
+  NCI_WINDOWS.forEach(function(w) {
+    ScriptApp.newTrigger(NCI_TRIGGER_FN).timeBased().everyDays(1).atHour(w.runAtHour).create();
+  });
+}
+function menuInstallNCITriggers() {
+  installNCITriggers();
+  _setConfig('nci_schedule', 'on');
+  SpreadsheetApp.getUi().alert('תזמון "מדד ארצי" הותקן: בוקר ' + NCI_WINDOWS[0].runAtHour +
+    ':00, ערב ' + NCI_WINDOWS[1].runAtHour + ':00 (כל יום).');
+}
+function menuRunNCINow() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  try {
+    _scheduledNCI();
+    var s = ss.getSheetByName(NCI_SHEET);
+    if (s) s.activate();
+  } catch (e) {
+    SpreadsheetApp.getUi().alert('חישוב המדד הארצי נכשל:\n' + e.message +
+      '\n\nאם זו שגיאת timeout של שירות הגיליונות — נפוץ במסמכים גדולים או כשפעולה אחרת רצה במקביל. המתן רגע ונסה שוב.');
+  }
+}
+
+// ═══ NCI EMAIL DIGEST ═════════════════════════════════════════════
+// Sent at the end of every _scheduledNCI run (morning ~10:00, evening ~20:00),
+// so recipients get one mail per rush window — twice a day. Default ON; the
+// recipient defaults to the sheet owner unless overridden in _config.
+
+function _nciEmailRecipients() {
+  var raw = _getConfig(NCI_EMAIL_TO_KEY) || _currentUserEmail();
+  return raw.split(/[,;]+/).map(function(s) { return s.trim(); }).filter(function(s) { return s; });
+}
+
+// One coloured "+12.3% · עמוס" pill, used in the headline and the trend.
+function _nciEmailPill(pct) {
+  var st = _nciStatus(pct);
+  return '<span style="display:inline-block;padding:3px 10px;border-radius:12px;font-weight:bold;' +
+         'background:' + st.bg + ';color:' + st.fg + '">' + _nciFmtPct(pct) + ' · ' + st.label + '</span>';
+}
+
+function _nciEmailHtml(nci, win, history) {
+  var st = _nciStatus(win.indexPct);
+  var dtLabel = nci.daytype === 'weekend' ? 'סופ"ש' : 'חול';
+  var h = [];
+  h.push('<div dir="rtl" style="font-family:Arial,Helvetica,sans-serif;max-width:640px;margin:0 auto;color:#1f2937">');
+
+  // Headline card
+  h.push('<div style="background:' + st.bg + ';border-radius:12px;padding:18px 20px;text-align:center">');
+  h.push('<div style="font-size:15px;color:' + st.fg + ';font-weight:bold">🚦 מדד תנועה ארצי · מסגרת ' +
+         win.key + ' (' + _winRangeLabel(win.key) + ')</div>');
+  h.push('<div style="font-size:40px;font-weight:bold;color:' + st.fg + ';margin:6px 0">' + _nciFmtPct(win.indexPct) + '</div>');
+  h.push('<div style="font-size:18px;color:' + st.fg + ';font-weight:bold">' + st.head + '</div>');
+  var ctx = [nci.dayName, dtLabel, nci.date, win.nJams + ' פקקים', win.nRoutes + ' מסלולים']
+              .filter(function(x) { return x; }).join(' · ');
+  h.push('<div style="font-size:13px;color:#475569;margin-top:6px">' + ctx + '</div>');
+  h.push('</div>');
+
+  // Worst routes table (rows already sorted descending by deviation)
+  var worst = (win.rows || []).filter(function(r) { return r.devPct != null; }).slice(0, 5);
+  if (worst.length) {
+    h.push('<h3 style="font-size:15px;margin:20px 0 8px">הכבדים ביותר במסגרת זו</h3>');
+    h.push('<table style="width:100%;border-collapse:collapse;font-size:13px">');
+    h.push('<tr style="background:#1F3864;color:#fff;font-weight:bold">' +
+           '<td style="padding:6px 8px;text-align:right">מסלול</td>' +
+           '<td style="padding:6px 8px;text-align:right">כיוון</td>' +
+           '<td style="padding:6px 8px;text-align:center">פקקים</td>' +
+           '<td style="padding:6px 8px;text-align:center">סטייה</td></tr>');
+    worst.forEach(function(r, i) {
+      var rst = _nciStatus(r.devPct);
+      h.push('<tr style="background:' + (i % 2 ? '#f8fafc' : '#fff') + '">' +
+             '<td style="padding:6px 8px;text-align:right">' + r.route + '</td>' +
+             '<td style="padding:6px 8px;text-align:right;color:#64748b">' + r.dir + '</td>' +
+             '<td style="padding:6px 8px;text-align:center">' + r.jams + '</td>' +
+             '<td style="padding:6px 8px;text-align:center;font-weight:bold;color:' + rst.fg + '">' +
+             _nciFmtPct(r.devPct) + '</td></tr>');
+    });
+    h.push('</table>');
+  }
+
+  // Recent trend for THIS window
+  var trend = (history || []).filter(function(r) { return r.window === win.key && r.index_pct != null; })
+                             .slice(-NCI_EMAIL_TREND);
+  if (trend.length > 1) {
+    h.push('<h3 style="font-size:15px;margin:20px 0 8px">מגמה אחרונה (' + win.key + ')</h3>');
+    h.push('<table style="border-collapse:collapse;font-size:13px"><tr>');
+    trend.forEach(function(r) {
+      h.push('<td style="padding:6px 10px;text-align:center;border-bottom:2px solid #e2e8f0">' +
+             '<div style="color:#64748b;font-size:11px">' + _ymd(r.date).slice(5) + '</div>' +
+             '<div style="margin-top:3px">' + _nciEmailPill(r.index_pct) + '</div></td>');
+    });
+    h.push('</tr></table>');
+  }
+
+  h.push('<p style="font-size:11px;color:#94a3b8;margin-top:24px;border-top:1px solid #e2e8f0;padding-top:10px">' +
+         'נשלח אוטומטית ע"י "מדד תנועה ארצי". להפסקה/שינוי נמענים: תפריט 🚦 Waze ← מתקדם, או הסר את הטריגרים.</p>');
+  h.push('</div>');
+  return h.join('');
+}
+
+function _sendNCIEmail(nci, win, history) {
+  if (_getConfig(NCI_EMAIL_CONFIG_KEY) === 'off') return false;
+  if (!win || win.indexPct == null) return false;
+  var to = _nciEmailRecipients();
+  if (!to.length) return false;
+  // Pull a few more readings than the slide keeps, so the same-window trend has depth.
+  var hist = history;
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    hist = _readNCIHistory(ss, NCI_EMAIL_TREND * 2 + 6);
+  } catch (_) {}
+  var st = _nciStatus(win.indexPct);
+  var subject = '🚦 מדד ארצי — ' + win.key + ' ' + nci.date + ': ' + _nciFmtPct(win.indexPct) + ' · ' + st.label;
+  MailApp.sendEmail({
+    to: to.join(','),
+    subject: subject,
+    htmlBody: _nciEmailHtml(nci, win, hist),
+    name: 'מדד תנועה ארצי',
+  });
+  return true;
+}
+
+// ─── Menu actions for the email digest ───
+function menuToggleNCIEmail() {
+  var ui = SpreadsheetApp.getUi();
+  var on = _getConfig(NCI_EMAIL_CONFIG_KEY) !== 'off';   // default on
+  _setConfig(NCI_EMAIL_CONFIG_KEY, on ? 'off' : 'on');
+  var to = _nciEmailRecipients();
+  ui.alert(on ? 'מייל "מדד ארצי" כובה.' :
+    'מייל "מדד ארצי" הופעל — יישלח אחרי כל חישוב (בוקר+ערב) אל:\n' +
+    (to.length ? to.join(', ') : '(בעל הגיליון)'));
+}
+function menuSetNCIEmailRecipients() {
+  var ui = SpreadsheetApp.getUi();
+  var cur = _getConfig(NCI_EMAIL_TO_KEY) || _currentUserEmail();
+  var res = ui.prompt('נמעני מייל "מדד ארצי"',
+    'הזן כתובת אחת או כמה, מופרדות בפסיק. השאר ריק כדי לחזור לבעל הגיליון.\n\nנוכחי: ' + cur,
+    ui.ButtonSet.OK_CANCEL);
+  if (res.getSelectedButton() !== ui.Button.OK) return;
+  _setConfig(NCI_EMAIL_TO_KEY, res.getResponseText().trim());
+  _setConfig(NCI_EMAIL_CONFIG_KEY, 'on');   // setting recipients implies wanting the mail
+  var to = _nciEmailRecipients();
+  ui.alert('נמענים עודכנו:\n' + (to.length ? to.join(', ') : '(בעל הגיליון)'));
+}
+// Build a minimal {nci, win} from the most recent _nci_history reading, so the
+// test mail works even when today's raw_data has no fresh rush-window rows.
+// History lacks per-route detail, so win.rows is empty (the worst-routes table
+// is simply omitted) — everything else mirrors a real reading.
+function _nciLatestFromHistory(ss) {
+  var hist = _readNCIHistory(ss, NCI_EMAIL_TREND * 2 + 6);
+  for (var i = hist.length - 1; i >= 0; i--) {
+    if (hist[i].index_pct != null && hist[i].index_pct !== '') {
+      var r = hist[i];
+      var win = { key: r.window, indexPct: _round1(+r.index_pct), nJams: r.n_jams, nRoutes: r.n_routes, rows: [] };
+      var nci = { date: _ymd(r.date), dayName: '', daytype: r.daytype, order: [r.window], windows: {} };
+      nci.windows[r.window] = win;
+      return { nci: nci, win: win, hist: hist };
+    }
+  }
+  return null;
+}
+
+function menuSendNCIEmailTest() {
+  var ui = SpreadsheetApp.getUi();
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  try {
+    var nci = null, win = null, hist = null, fromHistory = false;
+    // Prefer a live recompute; fall back to the latest stored reading.
+    try {
+      var baselines = _computeBaselines(ss);
+      nci = _nciData(ss, baselines);
+    } catch (_) {}
+    if (nci && nci.order.length) {
+      for (var i = nci.order.length - 1; i >= 0; i--) {
+        if (nci.windows[nci.order[i]].indexPct != null) { win = nci.windows[nci.order[i]]; break; }
+      }
+    }
+    if (!win) {
+      var fb = _nciLatestFromHistory(ss);
+      if (fb) { nci = fb.nci; win = fb.win; hist = fb.hist; fromHistory = true; }
+    }
+    if (!win) {
+      ui.alert('אין עדיין מדד לשליחה — לא בנתונים החיים ולא בהיסטוריה.\n\nהרץ קודם "🚦 חשב מדד ארצי עכשיו". אם גם זה נכשל, ייתכן שאין נתוני שעות שיא בתאריך האחרון או שחסר בייסליין ב-_baseline_archive.');
+      return;
+    }
+    var prev = _getConfig(NCI_EMAIL_CONFIG_KEY);
+    _setConfig(NCI_EMAIL_CONFIG_KEY, 'on');   // force-send even if currently off
+    var sent = _sendNCIEmail(nci, win, hist || _readNCIHistory(ss, NCI_EMAIL_TREND * 2 + 6));
+    if (prev === 'off') _setConfig(NCI_EMAIL_CONFIG_KEY, 'off');
+    ui.alert(!sent ? 'לא נשלח (אין נמענים).' :
+      'נשלח מייל בדיקה אל:\n' + _nciEmailRecipients().join(', ') +
+      (fromHistory ? '\n\n(נשלח לפי הקריאה האחרונה מההיסטוריה, כי אין מדד חי כרגע.)' : ''));
+  } catch (e) {
+    ui.alert('שליחת מייל הבדיקה נכשלה:\n' + e.message);
+  }
+}
+
 function _sheet0_dashboard(ss, jams, filter, baselines) {
   var ws = _newSheet(ss, '🎯 לוח מחוונים', '#0EA5E9');
 
