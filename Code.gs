@@ -1954,6 +1954,21 @@ function _nciStatus(dev) {
   return                   { label: 'טוב מהרגיל',   head: 'קל מהרגיל',                bg: '#DBEAFE', fg: '#1E40AF' };
 }
 
+// A national index built on too few jams/routes is statistically noisy — the
+// number is jam-weighted, so on a thin window a handful of quiet routes can swing
+// it ±30% (e.g. a quiet Saturday evening with ~50 jams). Returns a caveat string
+// when the sample is thin, or '' when it's solid. Used as a side-note NEXT TO the
+// number — never to hide it. Weekend windows are inherently lighter, so they trip
+// this more often than weekdays, which is intended.
+var NCI_MIN_JAMS = 80, NCI_MIN_ROUTES = 12;
+function _nciLowConfidence(win) {
+  if (!win || win.indexPct == null) return '';
+  if (win.nJams < NCI_MIN_JAMS || win.nRoutes < NCI_MIN_ROUTES) {
+    return 'מדגם קטן (' + win.nJams + ' פקקים, ' + win.nRoutes + ' מסלולים) — המדד עשוי להיות פחות יציב';
+  }
+  return '';
+}
+
 // Core: read the latest date's window jams (filter-independent), compute the
 // per-route deviation and the jam-weighted national index per window.
 function _nciData(ss, baselines) {
@@ -2199,9 +2214,11 @@ function _sheetTimeframes(ss, nci, baselines) {
   nci.order.forEach(function(wk) {
     var win = nci.windows[wk];
     var st = _nciStatus(win.indexPct);
+    var lc = _nciLowConfidence(win);
     ws.getRange(row, 1, 1, cols.length).merge()
       .setValue('🚦 מסגרת ' + wk + ' (' + _winRangeLabel(wk) + ')  ·  מדד ארצי משוקלל: ' +
-                _nciFmtPct(win.indexPct) + '  ·  ' + st.label + '  ·  ' + win.nJams + ' פקקים, ' + win.nRoutes + ' מסלולים')
+                _nciFmtPct(win.indexPct) + '  ·  ' + st.label + '  ·  ' + win.nJams + ' פקקים, ' + win.nRoutes + ' מסלולים' +
+                (lc ? '  ·  ⚠️ ' + lc : ''))
       .setBackground(C_SEC_BG).setFontColor(C_SEC_FG).setFontWeight('bold').setHorizontalAlignment('right');
     row++;
     win.rows.forEach(function(rw) {
@@ -2261,6 +2278,14 @@ function _sheetNCI(ss, nci, history) {
        '   ·   ' + head.nRoutes + ' מסלולים   ·   ' + head.nJams + ' פקקים')
     : 'אין עדיין נתונים לחלון הנוכחי בתאריך ' + nci.date + '.';
   ws.getRange(8, 1, 1, nc).merge().setValue(sub).setFontSize(11).setFontColor('#475569').setHorizontalAlignment('center');
+
+  // Thin-sample caveat shown right under the headline number (row 9, otherwise blank).
+  var lcHead = _nciLowConfidence(head);
+  if (lcHead) {
+    ws.getRange(9, 1, 1, nc).merge().setValue('⚠️ ' + lcHead)
+      .setFontSize(11).setFontWeight('bold').setFontColor('#92400E').setBackground('#FEF3C7')
+      .setHorizontalAlignment('center');
+  }
 
   var row = 10;
   _secRow(ws, row, nc, 'מדד לפי חלון — ' + nci.date); row++;
@@ -2400,6 +2425,11 @@ function _nciEmailHtml(nci, win, history, mapUrl) {
   var ctx = [nci.dayName, dtLabel, nci.date, win.nJams + ' פקקים', win.nRoutes + ' מסלולים']
               .filter(function(x) { return x; }).join(' · ');
   h.push('<div style="font-size:13px;color:#475569;margin-top:6px">' + ctx + '</div>');
+  var lc = _nciLowConfidence(win);
+  if (lc) {
+    h.push('<div style="font-size:12px;color:#92400E;background:#FEF3C7;border-radius:8px;' +
+           'padding:6px 10px;margin-top:8px;display:inline-block">⚠️ ' + lc + '</div>');
+  }
   h.push('</div>');
 
   // Link to the free interactive heatmap (Leaflet web app)
