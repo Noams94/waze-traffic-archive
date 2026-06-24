@@ -35,6 +35,7 @@ var NCI_TREND_POINTS    = 14;   // how many recent readings the slide's trend sh
 var NCI_EMAIL_CONFIG_KEY = 'nci_email';      // 'on' (default) | 'off' — email the index after each run
 var NCI_EMAIL_TO_KEY     = 'nci_email_to';   // comma/semicolon-separated recipients; blank = sheet owner
 var NCI_EMAIL_TREND      = 7;   // recent same-window readings shown in the email trend
+var NCI_MAP_KEY_CONFIG_KEY = 'nci_geoapify_key';   // Geoapify Static Maps key (free, no card); blank = email sent without the map image
 // Published /exec URL of the anonymous "Map" web-app deployment. Hardcoded because
 // ScriptApp.getService().getUrl() can return the owner-only /dev URL (multi-login
 // fails) and the bare /exec can serve a stale edge-cached response. _nciMapUrl()
@@ -105,6 +106,7 @@ function onOpen() {
     .addItem('📤 שלח מייל מדד עכשיו (בדיקה)', 'menuSendNCIEmailTest')
     .addSeparator()
     .addItem('🗺️ פתח מפת חום אינטראקטיבית', 'menuOpenCongestionMap')
+    .addItem('🔑 הגדר מפתח מפת חום למייל (Geoapify)...', 'menuSetNCIMapApiKey')
     .addSeparator()
     .addSubMenu(advanced)
     .addSeparator()
@@ -2095,6 +2097,65 @@ function _nciRegionDeviations(win) {
   return out;
 }
 
+// Build a Geoapify Static Maps URL: the 3 region polygons filled by their
+// deviation color (via _nciStatus) over a real OSM map. Geoapify free tier needs
+// only a key (no credit card). Returns '' when no key is configured.
+function _nciStaticMapUrl(win) {
+  var key = _getConfig(NCI_MAP_KEY_CONFIG_KEY);
+  if (!key) return '';
+  var devs = _nciRegionDeviations(win);
+  var geoms = [];
+  Object.keys(REGION_GEO).forEach(function(name) {
+    var ring = REGION_GEO[name];
+    if (!ring || !ring.length) return;
+    var dev = devs[name] ? devs[name].devPct : null;
+    var hex = _nciStatus(dev).fg.replace('#', '');
+    var pts = ring.map(function(p) { return p[1] + ',' + p[0]; });   // Geoapify wants lon,lat
+    pts.push(ring[0][1] + ',' + ring[0][0]);                          // close the ring
+    geoms.push('polygon:' + pts.join(',') +
+               ';linewidth:2;linecolor:%23' + hex + ';fillcolor:%23' + hex + ';fillopacity:0.45');
+  });
+  if (!geoms.length) return '';
+  var params = [
+    'style=osm-bright', 'width=600', 'height=500', 'scaleFactor=2',
+    'center=lonlat:35.0,31.4', 'zoom=7',
+    'geometry=' + geoms.join('|'),
+    'apiKey=' + encodeURIComponent(key),
+  ];
+  return 'https://maps.geoapify.com/v1/staticmap?' + params.join('&');
+}
+
+// Fetch the static region map as a PNG blob, or null if no key / non-200 / error.
+function _nciStaticMapBlob(win) {
+  var url = _nciStaticMapUrl(win);
+  if (!url) return null;
+  try {
+    var resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    if (resp.getResponseCode() !== 200) return null;
+    return resp.getBlob().setName('congestion_map.png');
+  } catch (e) { return null; }
+}
+
+// Dev preview: log the static-map URL for the latest window to open in a browser.
+function _previewStaticMapUrl() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  Logger.log(_nciStaticMapUrl(_latestWindowWithRows(ss) || { rows: [] }) || '(אין מפתח Geoapify מוגדר)');
+}
+
+function menuSetNCIMapApiKey() {
+  var ui = SpreadsheetApp.getUi();
+  var cur = _getConfig(NCI_MAP_KEY_CONFIG_KEY);
+  var res = ui.prompt('מפתח Geoapify למפת החום במייל',
+    'הזן מפתח Geoapify (חינמי, הרשמה ללא כרטיס אשראי ב-geoapify.com). ' +
+    'השאר ריק כדי לבטל — המייל יישלח ללא התמונה (הקישור למפה האינטראקטיבית יישאר).\n\n' +
+    'נוכחי: ' + (cur ? cur.slice(0, 6) + '…' : '(לא מוגדר)'),
+    ui.ButtonSet.OK_CANCEL);
+  if (res.getSelectedButton() !== ui.Button.OK) return;
+  _setConfig(NCI_MAP_KEY_CONFIG_KEY, res.getResponseText().trim());
+  ui.alert(res.getResponseText().trim() ? 'מפתח Geoapify נשמר — המייל יכלול תמונת מפה.'
+                                        : 'המפתח נוקה — המייל יישלח ללא תמונה.');
+}
+
 // Most recent NCI window that actually has per-route rows (a live recompute;
 // history rows are empty so they would render all-grey). Returns null if none.
 function _latestWindowWithRows(ss) {
@@ -2416,7 +2477,7 @@ function _nciEmailPill(pct) {
          'background:' + st.bg + ';color:' + st.fg + '">' + _nciFmtPctLtr(pct) + ' · ' + st.label + '</span>';
 }
 
-function _nciEmailHtml(nci, win, history, mapUrl) {
+function _nciEmailHtml(nci, win, history, mapUrl, hasMap) {
   var st = _nciStatus(win.indexPct);
   var dtLabel = nci.daytype === 'weekend' ? 'סופ"ש' : 'חול';
   var h = [];
@@ -2438,12 +2499,20 @@ function _nciEmailHtml(nci, win, history, mapUrl) {
   }
   h.push('</div>');
 
+  // Regional heatmap image (Geoapify PNG, attached inline as cid:congestionmap)
+  if (hasMap) {
+    h.push('<div style="text-align:center;margin:16px 0 6px">');
+    h.push('<img src="cid:congestionmap" alt="מפת חום אזורית" ' +
+           'style="width:100%;max-width:600px;border-radius:10px;border:1px solid #e2e8f0">');
+    h.push('</div>');
+  }
+
   // Link to the free interactive heatmap (Leaflet web app)
   if (mapUrl) {
-    h.push('<div style="text-align:center;margin:16px 0 18px">' +
+    h.push('<div style="text-align:center;margin:' + (hasMap ? '6px' : '16px') + ' 0 18px">' +
            '<a href="' + mapUrl + '" style="display:inline-block;background:#1F3864;color:#fff;' +
            'text-decoration:none;padding:10px 18px;border-radius:8px;font-weight:bold">' +
-           '🗺️ פתח מפת חום אינטראקטיבית</a></div>');
+           '🗺️ פתח מפה אינטראקטיבית</a></div>');
   }
 
   // Worst routes table (rows already sorted descending by deviation)
@@ -2502,12 +2571,15 @@ function _sendNCIEmail(nci, win, history) {
   var st = _nciStatus(win.indexPct);
   var subject = '🚦 מדד ארצי — ' + win.key + ' ' + nci.date + ': ⁦' + _nciFmtPct(win.indexPct) + '⁩ · ' + st.label;
   var mapUrl = _nciMapUrl(nci.date + '-' + win.key);   // stable per send, cache-busted
-  MailApp.sendEmail({
+  var mapBlob = _nciStaticMapBlob(win);   // null when no Geoapify key / fetch failed → email sent without the image
+  var msg = {
     to: to.join(','),
     subject: subject,
-    htmlBody: _nciEmailHtml(nci, win, hist, mapUrl),
+    htmlBody: _nciEmailHtml(nci, win, hist, mapUrl, !!mapBlob),
     name: 'מדד תנועה ארצי',
-  });
+  };
+  if (mapBlob) msg.inlineImages = { congestionmap: mapBlob };   // key must match cid:congestionmap
+  MailApp.sendEmail(msg);
   return true;
 }
 
