@@ -10,12 +10,12 @@ var SOURCES_SHEET = 'מקור';
 var FILTER_SHEET  = '_filter';   // hidden, stores last applied filter
 var BASELINE_ARCHIVE = '_baseline_archive';   // hidden, permanent aggregated counters
 var RETENTION_DAYS = 30;
-// Safety cap: Google Sheets enforces ~10M cells per spreadsheet. With 18 RAW_COLS
-// that's ~555K rows before raw_data alone hits the wall — BUT Sheets allocates
+// Safety cap: Google Sheets enforces ~10M cells per spreadsheet. With 19 RAW_COLS
+// that's ~525K rows before raw_data alone hits the wall — BUT Sheets allocates
 // a small column buffer (typically 2 trailing empty cols), pushing the effective
-// width to 20. To leave breathing room for the buffer + ~200K cells used by the
+// width to 21. To leave breathing room for the buffer + ~200K cells used by the
 // other sheets, trigger emergency prune well below the theoretical max.
-// At 20 cols/row: 450K × 20 = 9M cells, leaving ~1M cells of headroom.
+// At 21 cols/row: 450K × 21 = 9.45M cells, leaving ~350K cells of headroom.
 var MAX_RAW_ROWS = 450000;
 
 // ─── National Traffic Index (NCI) ─────────────
@@ -29,7 +29,7 @@ var NCI_WINDOWS = [
 var NCI_SHEET           = '🚦 מדד ארצי';
 var NCI_TIMEFRAME_SHEET = 'פירוט לפי מסגרת זמן';
 var NCI_HISTORY_SHEET   = '_nci_history';   // hidden, permanent — survives the 30-day prune
-var NCI_HISTORY_COLS    = ['run_ts','date','window','daytype','index_pct','n_jams','n_routes'];
+var NCI_HISTORY_COLS    = ['run_ts','date','window','daytype','index_pct','n_jams','n_routes','period'];
 var NCI_TRIGGER_FN      = '_scheduledNCI';
 var NCI_TREND_POINTS    = 14;   // how many recent readings the slide's trend shows
 var NCI_EMAIL_CONFIG_KEY = 'nci_email';      // 'on' (default) | 'off' — email the index after each run
@@ -87,6 +87,7 @@ function onOpen() {
     .addItem('▶️ המשך ייצוא תקוע', 'menuResumeArchiveJob')
     .addItem('🛑 בטל ייצוא תקוע', 'menuCancelArchiveJob')
     .addItem('🔄 העבר נתונים קיימים לארכיון אגרגטיבי', 'menuMigrateToArchive')
+    .addItem('🔴 סווג חירום/שגרה לנתונים קיימים', 'menuBackfillPeriod')
     .addSeparator()
     .addItem('📊 בדוק שימוש בתאים', 'menuDiagnoseCellUsage')
     .addItem('🗜️ דחס תאים ריקים', 'menuCompactSheets')
@@ -107,6 +108,7 @@ function onOpen() {
     .addSeparator()
     .addItem('🗺️ פתח מפת חום אינטראקטיבית', 'menuOpenCongestionMap')
     .addItem('🔑 הגדר מפתח מפת חום למייל (Geoapify)...', 'menuSetNCIMapApiKey')
+    .addItem('🧪 בדוק תמונת מפה למייל', 'menuTestNCIMapImage')
     .addSeparator()
     .addSubMenu(advanced)
     .addSeparator()
@@ -203,6 +205,39 @@ function menuMigrateToArchive() {
     'הועברו ' + r.processed + ' שורות מ-raw_data לארכיון אגרגטיבי קבוע.\n\n' +
     'הארכיון נמצא בלשונית מוסתרת _baseline_archive ומשמש לחישוב baseline היסטוריים.',
     ui.ButtonSet.OK);
+}
+
+// Backfill the 'period' column for raw_data rows imported before the column
+// existed. Re-derives חירום/שגרה from each row's pub_ts. Idempotent — safe to
+// re-run (e.g. after declaring a new emergency window in EMERGENCY_WINDOWS).
+function menuBackfillPeriod() {
+  var ui = SpreadsheetApp.getUi();
+  var resp = ui.alert('סיווג חירום/שגרה',
+    'למלא את עמודת "period" (חירום/שגרה) לכל השורות הקיימות ב-raw_data לפי זמן הפקק?\n\n' +
+    'בטוח להרצה חוזרת. ירוץ גם על שורות שכבר סווגו (לעדכון אחרי שינוי חלוני חירום).',
+    ui.ButtonSet.OK_CANCEL);
+  if (resp !== ui.Button.OK) return;
+  try {
+    var n = _backfillRawPeriod(SpreadsheetApp.getActiveSpreadsheet());
+    ui.alert('הושלם', 'סווגו ' + n + ' שורות ב-raw_data.', ui.ButtonSet.OK);
+  } catch (e) {
+    ui.alert('שגיאה', 'הסיווג נכשל:\n' + e.message, ui.ButtonSet.OK);
+  }
+}
+function _backfillRawPeriod(ss) {
+  var s = ss.getSheetByName(RAW_SHEET);
+  if (!s) return 0;
+  var col = RAW_COLS.indexOf('period') + 1;   // 1-based; column may not exist yet on old sheets
+  // Ensure the header cell exists/labelled (old sheets froze at 18 cols).
+  s.getRange(1, col).setValue('period')
+   .setBackground('#1F3864').setFontColor('#fff').setFontWeight('bold');
+  var n = s.getLastRow() - 1;
+  if (n < 1) return 0;
+  // pub_ts lives in column 2; derive period from it in one batched read/write.
+  var ts = _retry(function() { return s.getRange(2, 2, n, 1).getValues(); });
+  var out = ts.map(function(r) { return [ _periodFromTs(r[0]) ]; });
+  _retry(function() { s.getRange(2, col, n, 1).setValues(out); });
+  return n;
 }
 
 function menuExportArchive() {
@@ -568,6 +603,9 @@ function _computeBaselines(ss) {
       var route = r[0], dir = r[1], date = r[2], hour = r[3];
       var n = +r[4] || 0, sumDelay = +r[5] || 0;
       if (!route || dir === '' || hour === '' || !n) return;
+      // Emergency periods are anomalous by definition — keep them out of the
+      // "routine" baseline so deviation % is measured against normal traffic.
+      if (_periodFromDateHour(date, hour) === PERIOD_EMERGENCY) return;
       var dt = _dayTypeFromDate(date);
       var k = route + '::' + dir + '::' + hour + '::' + dt;
       var b = byRDH[k] = byRDH[k] || { n: 0, sumDelay: 0 };
@@ -825,7 +863,8 @@ function clearAllData() {
 
 var RAW_COLS = ['snapshot_ts','pub_ts','date','day','hour','tbin',
                 'street','city','level','length_m','delay_s','speed_kmh',
-                'start_node','end_node','tt_min','route_name','dir_ix','archived'];
+                'start_node','end_node','tt_min','route_name','dir_ix','archived',
+                'period'];   // חירום/שגרה — appended last so positional indices 0..17 are unchanged
 
 function _ensureRawSheet(ss) {
   var s = ss.getSheetByName(RAW_SHEET);
@@ -902,6 +941,7 @@ function _appendToRawData(ss, jams, snapshotTs) {
       spd > 0 ? Math.round((ln / 1000) / spd * 60 * 100) / 100 : '',
       routeName, dirIx,
       true,                                              // archived = true (already aggregated)
+      _periodFromTs(dt),                                 // period: חירום/שגרה by jam time
     ];
   });
   if (rows.length) {
@@ -1765,7 +1805,7 @@ var ROUTES = [
 var REGION_GEO = {
   'צפון': [[33.08,35.10],[33.28,35.58],[33.10,35.62],[32.70,35.57],[32.50,35.50],[32.50,35.00],[32.55,34.92],[32.83,34.95]],
   'מרכז': [[32.55,34.92],[32.40,34.88],[32.08,34.76],[31.79,34.63],[31.55,34.50],[31.45,34.45],[31.45,35.40],[31.76,35.55],[32.20,35.57],[32.50,35.50],[32.50,35.00]],
-  'דרום': [[31.45,34.45],[31.45,35.40],[31.00,35.40],[30.50,35.15],[29.55,34.98],[29.55,34.95],[30.40,34.43],[31.10,34.27],[31.35,34.30]],
+  'דרום': [[31.45,34.45],[31.45,35.40],[30.90,35.35],[30.10,35.10],[29.55,34.95],[30.50,34.43],[31.10,34.30],[31.30,34.33]],
 };
 
 // ═══ STYLING ══════════════════════════════════
@@ -1876,6 +1916,44 @@ function _dayType(dayName) {
 function _dayTypeFromDate(dateStr) {
   var d = new Date(dateStr).getDay();   // 0=Sun..6=Sat
   return (d === 5 || d === 6) ? 'weekend' : 'weekday';
+}
+
+// ─── Period: חירום (emergency) vs שגרה (routine) ───────────────────
+// A SECOND, independent classification of every jam — by WHEN it happened, not by
+// day-of-week. Unlike daytype (derived), periods are explicit date-time windows
+// declared in EMERGENCY_WINDOWS below. Anything outside every window is שגרה.
+// Windows are half-open [from, to) in local time (Asia/Hebron ≈ Asia/Jerusalem),
+// written as 'yyyy-MM-dd HH:mm' so a plain lexicographic string compare is exact
+// and timezone-clean (same fixed-width format the timestamps are formatted into).
+// To declare a new emergency, add another { from, to } entry.
+var PERIOD_EMERGENCY = 'חירום';
+var PERIOD_ROUTINE   = 'שגרה';
+var EMERGENCY_WINDOWS = [
+  { from: '2026-06-07 22:00', to: '2026-06-09 06:00' },
+];
+
+// Core test: a local 'yyyy-MM-dd HH:mm' key → 'חירום' | 'שגרה'.
+function _periodFromKey(key) {
+  for (var i = 0; i < EMERGENCY_WINDOWS.length; i++) {
+    var w = EMERGENCY_WINDOWS[i];
+    if (key >= w.from && key < w.to) return PERIOD_EMERGENCY;
+  }
+  return PERIOD_ROUTINE;
+}
+// From a full timestamp (Date / millis / ISO string) — minute resolution.
+function _periodFromTs(ts) {
+  if (ts === null || ts === undefined || ts === '') return PERIOD_ROUTINE;
+  var d = (ts instanceof Date) ? ts : new Date(ts);
+  if (isNaN(d.getTime())) return PERIOD_ROUTINE;
+  return _periodFromKey(Utilities.formatDate(d, 'Asia/Jerusalem', 'yyyy-MM-dd HH:mm'));
+}
+// From a date (string/Date) + integer hour — for _baseline_archive, which stores
+// date+hour rather than a full timestamp. Resolves at HH:00.
+function _periodFromDateHour(dateStr, hour) {
+  var ymd = _ymd(dateStr);
+  if (!ymd) return PERIOD_ROUTINE;
+  var h = parseInt(hour, 10); if (isNaN(h)) h = 0;
+  return _periodFromKey(ymd + ' ' + _pad(h) + ':00');
 }
 
 // Lookup table built lazily: street → { routeName, dirIx }.
@@ -2063,14 +2141,17 @@ function _nciData(ss, baselines) {
       key: w.key, hours: w.hours, rows: rows,
       indexPct: totDevJams > 0 ? _round1(totDevNum / totDevJams) : null,
       nJams: totJams, nRoutes: contribCells,
+      period: _periodFromDateHour(date, w.hours[0]),   // חירום/שגרה for this window
     };
     order.push(w.key);
   });
 
+  var headline = order.length ? windows[order[order.length - 1]] : null;
   return {
     date: date, dayName: dayName, daytype: daytype,
+    period: headline ? headline.period : _periodFromDateHour(date, 12),
     windows: windows, order: order,
-    headline: order.length ? windows[order[order.length - 1]] : null,
+    headline: headline,
   };
 }
 
@@ -2097,29 +2178,36 @@ function _nciRegionDeviations(win) {
   return out;
 }
 
-// Build a Geoapify Static Maps URL: the 3 region polygons filled by their
-// deviation color (via _nciStatus) over a real OSM map. Geoapify free tier needs
-// only a key (no credit card). Returns '' when no key is configured.
-function _nciStaticMapUrl(win) {
+// Build a Geoapify Static Maps URL: region polygons filled by their deviation
+// color (via _nciStatus) over a real OSM map. Geoapify free tier needs only a key
+// (no credit card). Returns '' when no key is configured. `names` limits which
+// regions to draw (defaults to all) — used by the per-region diagnostic.
+function _nciStaticMapUrl(win, names) {
   var key = _getConfig(NCI_MAP_KEY_CONFIG_KEY);
   if (!key) return '';
   var devs = _nciRegionDeviations(win);
   var geoms = [];
-  Object.keys(REGION_GEO).forEach(function(name) {
+  (names || Object.keys(REGION_GEO)).forEach(function(name) {
     var ring = REGION_GEO[name];
     if (!ring || !ring.length) return;
     var dev = devs[name] ? devs[name].devPct : null;
-    var hex = _nciStatus(dev).fg.replace('#', '');
+    var hex = _nciStatus(dev).fg.replace('#', '').toLowerCase();   // 6 lowercase hex digits (Geoapify is strict)
     var pts = ring.map(function(p) { return p[1] + ',' + p[0]; });   // Geoapify wants lon,lat
     pts.push(ring[0][1] + ',' + ring[0][0]);                          // close the ring
     geoms.push('polygon:' + pts.join(',') +
                ';linewidth:2;linecolor:%23' + hex + ';fillcolor:%23' + hex + ';fillopacity:0.45');
   });
   if (!geoms.length) return '';
+  // Keep delimiters literal (matches Geoapify's docs format and stays short — full
+  // encoding tripled the length and the last polygon got truncated). Only '#'→%23
+  // and the '|' separator→%7C are encoded, which both UrlFetchApp and Geoapify accept.
+  // Portrait image + an area rect framing all of Israel (Eilat→Metula). Israel is
+  // tall and narrow, so a fixed center+zoom on a landscape image cropped the ends.
+  // area=rect is NW(lon,lat) then SE(lon,lat); it overrides center/zoom.
   var params = [
-    'style=osm-bright', 'width=600', 'height=500', 'scaleFactor=2',
-    'center=lonlat:35.0,31.4', 'zoom=7',
-    'geometry=' + geoms.join('|'),
+    'style=osm-bright', 'width=520', 'height=640', 'scaleFactor=2',
+    'area=rect:34.0,33.5,36.0,29.3',
+    'geometry=' + geoms.join('%7C'),
     'apiKey=' + encodeURIComponent(key),
   ];
   return 'https://maps.geoapify.com/v1/staticmap?' + params.join('&');
@@ -2154,6 +2242,38 @@ function menuSetNCIMapApiKey() {
   _setConfig(NCI_MAP_KEY_CONFIG_KEY, res.getResponseText().trim());
   ui.alert(res.getResponseText().trim() ? 'מפתח Geoapify נשמר — המייל יכלול תמונת מפה.'
                                         : 'המפתח נוקה — המייל יישלח ללא תמונה.');
+}
+
+// Diagnose the email map image: fetches the Geoapify URL and reports the result.
+function menuTestNCIMapImage() {
+  var ui = SpreadsheetApp.getUi();
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!_getConfig(NCI_MAP_KEY_CONFIG_KEY)) {
+    ui.alert('אין מפתח Geoapify מוגדר.\nהגדר אותו דרך "🔑 הגדר מפתח מפת חום למייל (Geoapify)".');
+    return;
+  }
+  var win = _latestWindowWithRows(ss) || { rows: [] };
+  function probe(url) {
+    try {
+      var resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+      var code = resp.getResponseCode();
+      return { code: code, body: code === 200 ? (resp.getBlob().getBytes().length + ' bytes') : resp.getContentText().slice(0, 300), len: url.length };
+    } catch (e) { return { code: 'EXC', body: e.message, len: url.length }; }
+  }
+  var url = _nciStaticMapUrl(win);
+  if (!url) { ui.alert('לא נוצר URL לתמונה.'); return; }
+  var full = probe(url);
+  if (full.code === 200) {
+    ui.alert('✅ התמונה נוצרה תקין.\nHTTP 200 · ' + full.body + '\nאורך URL: ' + full.len);
+    return;
+  }
+  // Isolate: probe each region on its own so we know exactly which polygon breaks.
+  var lines = ['⚠️ הכל ביחד: HTTP ' + full.code + ' (URL ' + full.len + ')', full.body, '', 'לכל אזור בנפרד:'];
+  Object.keys(REGION_GEO).forEach(function(name) {
+    var r = probe(_nciStaticMapUrl(win, [name]));
+    lines.push('• ' + name + ': HTTP ' + r.code + (r.code === 200 ? ' ✅ (' + r.body + ')' : ' ✗'));
+  });
+  ui.alert(lines.join('\n'));
 }
 
 // Most recent NCI window that actually has per-route rows (a live recompute;
@@ -2255,7 +2375,8 @@ function _appendNCIHistory(ss, win, date, daytype) {
       if (_ymd(keys[i][0]) === date && keys[i][1] === win.key) return false;
     }
   }
-  s.appendRow([new Date(), date, win.key, daytype, win.indexPct, win.nJams, win.nRoutes]);
+  s.appendRow([new Date(), date, win.key, daytype, win.indexPct, win.nJams, win.nRoutes,
+               win.period || _periodFromDateHour(date, (win.hours && win.hours[0]) || 12)]);
   return true;
 }
 function _readNCIHistory(ss, limit) {
@@ -2266,14 +2387,15 @@ function _readNCIHistory(ss, limit) {
   var start = Math.max(0, n - limit);
   return s.getRange(2 + start, 1, n - start, NCI_HISTORY_COLS.length).getValues().map(function(r) {
     return { run_ts: r[0], date: r[1], window: r[2], daytype: r[3],
-             index_pct: Number(r[4]), n_jams: Number(r[5]), n_routes: Number(r[6]) };
+             index_pct: Number(r[4]), n_jams: Number(r[5]), n_routes: Number(r[6]),
+             period: r[7] || PERIOD_ROUTINE };
   });
 }
 
 // ─── Tab: פירוט לפי מסגרת זמן (window-level detail that feeds the index) ───
 function _sheetTimeframes(ss, nci, baselines) {
   var ws = _newSheet(ss, NCI_TIMEFRAME_SHEET, '#2E75B6');
-  var cols = ['אזור','מסלול','כיוון','מסגרת זמן','סוג יום','מס\' פקקים','סטייה %','מקור השוואה','סטטוס'];
+  var cols = ['אזור','מסלול','כיוון','מסגרת זמן','סוג יום','תקופה','מס\' פקקים','סטייה %','מקור השוואה','סטטוס'];
   _tabIntro(ws, cols.length, 'אותה השוואה כמו "פירוט לפי שעה", אך השעות מקובצות למסגרות (בוקר 06–10 / ערב 16–19). "מדד התנועה הארצי" = הממוצע המשוקלל לפי מס\' פקקים של עמודת "סטייה %" בכל מסגרת. חיובי = כבד מהשגרה, שלילי = קל. השוואה מול _baseline_archive (כל ההיסטוריה).', 1);
   _hdrRow(ws, cols, 2);
   var row = 3;
@@ -2290,11 +2412,11 @@ function _sheetTimeframes(ss, nci, baselines) {
     row++;
     win.rows.forEach(function(rw) {
       var rst = _nciStatus(rw.devPct);
-      _dataRow(ws, row, [rw.section, rw.route, rw.dir, wk, dtLabel, rw.jams,
+      _dataRow(ws, row, [rw.section, rw.route, rw.dir, wk, dtLabel, win.period, rw.jams,
                          rw.devPct != null ? _nciFmtPct(rw.devPct) : '—', rw.source, rst.label],
                row % 2 === 0);
-      if (rw.devPct != null) _colorDeviation(ws, row, 7, rw.devPct);
-      _colorStatus(ws, row, 9, rst.label);
+      if (rw.devPct != null) _colorDeviation(ws, row, 8, rw.devPct);
+      _colorStatus(ws, row, 10, rst.label);
       row++;
     });
   });
@@ -2324,6 +2446,7 @@ function _sheetNCI(ss, nci, history) {
   var winLbl = head ? (head.key + ' ' + _winRangeLabel(head.key)) : '—';
   ws.getRange(2, 1, 1, nc).merge()
     .setValue('תאריך ' + nci.date + '   •   חלון ' + winLbl + '   •   ' + dtLabel +
+              '   •   ' + (nci.period === PERIOD_EMERGENCY ? '🔴 חירום' : 'שגרה') +
               '   •   עודכן ' + Utilities.formatDate(new Date(), 'Asia/Jerusalem', 'dd/MM HH:mm'))
     .setFontSize(11).setFontColor('#475569').setBackground('#F1F5F9').setHorizontalAlignment('center');
 
@@ -2489,7 +2612,8 @@ function _nciEmailHtml(nci, win, history, mapUrl, hasMap) {
          win.key + ' (' + _winRangeLabel(win.key) + ')</div>');
   h.push('<div style="font-size:40px;font-weight:bold;color:' + st.fg + ';margin:6px 0">' + _nciFmtPctLtr(win.indexPct) + '</div>');
   h.push('<div style="font-size:18px;color:' + st.fg + ';font-weight:bold">' + st.head + '</div>');
-  var ctx = [nci.dayName, dtLabel, nci.date, win.nJams + ' פקקים', win.nRoutes + ' מסלולים']
+  var ctx = [nci.dayName, dtLabel, (win.period === PERIOD_EMERGENCY ? '🔴 חירום' : 'שגרה'),
+             nci.date, win.nJams + ' פקקים', win.nRoutes + ' מסלולים']
               .filter(function(x) { return x; }).join(' · ');
   h.push('<div style="font-size:13px;color:#475569;margin-top:6px">' + ctx + '</div>');
   var lc = _nciLowConfidence(win);
@@ -2503,7 +2627,7 @@ function _nciEmailHtml(nci, win, history, mapUrl, hasMap) {
   if (hasMap) {
     h.push('<div style="text-align:center;margin:16px 0 6px">');
     h.push('<img src="cid:congestionmap" alt="מפת חום אזורית" ' +
-           'style="width:100%;max-width:600px;border-radius:10px;border:1px solid #e2e8f0">');
+           'style="width:100%;max-width:420px;border-radius:10px;border:1px solid #e2e8f0">');
     h.push('</div>');
   }
 
@@ -3266,7 +3390,8 @@ function _sheet6_legend(ss) {
 
     { type: BLANK },
     { type: SEC, text: '§12. מילון מונחים מקוצר' },
-    { type: ROW, a: 'daytype', b: 'סוג יום: weekday (חול) או weekend (סופ"ש).' },
+    { type: ROW, a: 'daytype', b: 'סוג יום: weekday (חול) או weekend (סופ"ש) — נגזר מיום בשבוע.' },
+    { type: ROW, a: 'period (תקופה)', b: 'חירום או שגרה — לפי חלוני חירום מוגדרים בקוד (EMERGENCY_WINDOWS). כרגע: 7.6.2026 22:00 → 9.6.2026 06:00. שעות חירום מוחרגות מחישוב ה-baseline כדי שהסטייה תימדד מול תנועת שגרה.' },
     { type: ROW, a: 'jam', b: 'פקק יחיד באירוע יחיד — שורה אחת ב-raw_data.' },
     { type: ROW, a: 'snapshot', b: 'תמונת מצב אחת מ-Waze (עשרות-מאות פקקים).' },
     { type: ROW, a: 'baseline', b: 'הממוצע ההיסטורי שנגדו משווים.' },
@@ -3314,7 +3439,7 @@ function _rebuildAggregation(ss) {
   if (!arch || arch.getLastRow() < 2) return;
 
   var ws = _newSheet(ss, 'אגרגציה לאורך זמן', '#7030A0');
-  var ncW = 9;
+  var ncW = 10;
   ws.getRange(1,1,1,ncW).merge()
     .setValue('מגמות לאורך זמן — מבוסס על הארכיון הקבוע (כל ההיסטוריה)')
     .setFontSize(15).setFontWeight('bold').setFontColor('#1F3864').setHorizontalAlignment('center');
@@ -3341,7 +3466,7 @@ function _rebuildAggregation(ss) {
     return a[3] - b[3];
   });
 
-  var cols = ['תאריך','סוג יום','מסלול','כיוון','שעה','מס\' פקקים',
+  var cols = ['תאריך','סוג יום','תקופה','מסלול','כיוון','שעה','מס\' פקקים',
               'השהיה ממוצעת (דק\')','מהירות ממוצעת','רמה ממוצעת'];
   _hdrRow(ws, cols, 3);
 
@@ -3360,6 +3485,7 @@ function _rebuildAggregation(ss) {
     var avgL = _round1(sumL / n);
     _dataRow(ws, row, [
       dateStr, dt === 'weekend' ? 'סופ"ש' : 'חול',
+      _periodFromDateHour(dateStr, hour),
       route, dirLabel[route+'::'+dir] || ('כיוון '+dir),
       _pad(hour)+':00',
       n, avgD, avgS, avgL
