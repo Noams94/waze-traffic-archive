@@ -1935,6 +1935,12 @@ function _nciFmtPct(p) {
   if (p == null) return '—';
   return (p >= 0 ? '+' : '') + _round1(p) + '%';
 }
+// Same value, isolated LTR so the minus stays on the LEFT of the number inside
+// RTL HTML (email). Use only in HTML contexts — not in plain sheet cells.
+function _nciFmtPctLtr(p) {
+  if (p == null) return '—';
+  return '<span dir="ltr" style="unicode-bidi:isolate">' + _nciFmtPct(p) + '</span>';
+}
 function _winRangeLabel(key) {
   for (var i = 0; i < NCI_WINDOWS.length; i++) {
     if (NCI_WINDOWS[i].key === key) {
@@ -2407,7 +2413,7 @@ function _nciEmailRecipients() {
 function _nciEmailPill(pct) {
   var st = _nciStatus(pct);
   return '<span style="display:inline-block;padding:3px 10px;border-radius:12px;font-weight:bold;' +
-         'background:' + st.bg + ';color:' + st.fg + '">' + _nciFmtPct(pct) + ' · ' + st.label + '</span>';
+         'background:' + st.bg + ';color:' + st.fg + '">' + _nciFmtPctLtr(pct) + ' · ' + st.label + '</span>';
 }
 
 function _nciEmailHtml(nci, win, history, mapUrl) {
@@ -2420,7 +2426,7 @@ function _nciEmailHtml(nci, win, history, mapUrl) {
   h.push('<div style="background:' + st.bg + ';border-radius:12px;padding:18px 20px;text-align:center">');
   h.push('<div style="font-size:15px;color:' + st.fg + ';font-weight:bold">🚦 מדד תנועה ארצי · מסגרת ' +
          win.key + ' (' + _winRangeLabel(win.key) + ')</div>');
-  h.push('<div style="font-size:40px;font-weight:bold;color:' + st.fg + ';margin:6px 0">' + _nciFmtPct(win.indexPct) + '</div>');
+  h.push('<div style="font-size:40px;font-weight:bold;color:' + st.fg + ';margin:6px 0">' + _nciFmtPctLtr(win.indexPct) + '</div>');
   h.push('<div style="font-size:18px;color:' + st.fg + ';font-weight:bold">' + st.head + '</div>');
   var ctx = [nci.dayName, dtLabel, nci.date, win.nJams + ' פקקים', win.nRoutes + ' מסלולים']
               .filter(function(x) { return x; }).join(' · ');
@@ -2457,7 +2463,7 @@ function _nciEmailHtml(nci, win, history, mapUrl) {
              '<td style="padding:6px 8px;text-align:right;color:#64748b">' + r.dir + '</td>' +
              '<td style="padding:6px 8px;text-align:center">' + r.jams + '</td>' +
              '<td style="padding:6px 8px;text-align:center;font-weight:bold;color:' + rst.fg + '">' +
-             _nciFmtPct(r.devPct) + '</td></tr>');
+             _nciFmtPctLtr(r.devPct) + '</td></tr>');
     });
     h.push('</table>');
   }
@@ -2494,7 +2500,7 @@ function _sendNCIEmail(nci, win, history) {
     hist = _readNCIHistory(ss, NCI_EMAIL_TREND * 2 + 6);
   } catch (_) {}
   var st = _nciStatus(win.indexPct);
-  var subject = '🚦 מדד ארצי — ' + win.key + ' ' + nci.date + ': ' + _nciFmtPct(win.indexPct) + ' · ' + st.label;
+  var subject = '🚦 מדד ארצי — ' + win.key + ' ' + nci.date + ': ⁦' + _nciFmtPct(win.indexPct) + '⁩ · ' + st.label;
   var mapUrl = _nciMapUrl(nci.date + '-' + win.key);   // stable per send, cache-busted
   MailApp.sendEmail({
     to: to.join(','),

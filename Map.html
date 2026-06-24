@@ -64,7 +64,12 @@
       if (dev >= -10) return 'תקין';
       return 'טוב מהרגיל';
     }
-    function fmtPct(v) { return (v > 0 ? '+' : '') + (Math.round(v * 10) / 10) + '%'; }
+    // Wrap in a LTR isolate (U+2066…U+2069) so "-22.6%" keeps the minus on the
+    // LEFT inside the RTL page instead of flipping to the right.
+    function fmtPct(v) {
+      var r = Math.round(v * 10) / 10;
+      return '⁦' + (r > 0 ? '+' : '') + r + '%⁩';
+    }
     function centroid(ring) {
       var la = 0, lo = 0;
       ring.forEach(function(p) { la += p[0]; lo += p[1]; });
