@@ -35,6 +35,11 @@ var NCI_TREND_POINTS    = 14;   // how many recent readings the slide's trend sh
 var NCI_EMAIL_CONFIG_KEY = 'nci_email';      // 'on' (default) | 'off' — email the index after each run
 var NCI_EMAIL_TO_KEY     = 'nci_email_to';   // comma/semicolon-separated recipients; blank = sheet owner
 var NCI_EMAIL_TREND      = 7;   // recent same-window readings shown in the email trend
+// Published /exec URL of the anonymous "Map" web-app deployment. Hardcoded because
+// ScriptApp.getService().getUrl() can return the owner-only /dev URL (multi-login
+// fails) and the bare /exec can serve a stale edge-cached response. _nciMapUrl()
+// appends a cache-busting token so menu/email links always load fresh.
+var NCI_MAP_WEBAPP_URL   = 'https://script.google.com/macros/s/AKfycby0PoDWYHg2iMSnmBZN1BEm8LRZRRUQ4fbn-3qPrWmfBB2-oP3Dba-XaK6B0pawFQDR_g/exec';
 
 // Resumable archive job: bounded work per execution, resumed via time trigger.
 // Smaller chunks + tighter budget = more frequent checkpoints and a safer exit
@@ -1750,54 +1755,16 @@ var ROUTES = [
   {section:'צפון',name:'כביש 8697',from:'רמות (גולן)',to:'רמות',distance_km:5,free_flow_min:5,streets_dir1:['8697'],streets_dir2:[],dir1_label:'שני הכיוונים',dir2_label:''},
 ];
 
-// Simplified polylines for the national highways, keyed by the exact ROUTES[].name.
-// Each value is an ordered list of [lat, lon] points (4–8 per road; more for the
-// long ones). Coordinates are approximate — endpoints plus a couple of bends — so
-// the line reads correctly over real map tiles, not survey-accurate geometry.
-// A route absent from this map is simply not drawn (no crash). See _routeGeoCoverage.
-var ROUTE_GEO = {
-  'כביש 1':   [[32.0750,34.7900],[31.9500,34.8800],[31.8500,34.9800],[31.8300,35.1000],[31.7900,35.1800],[31.7780,35.2140]],
-  'כביש 4':   [[31.7900,34.6500],[31.9500,34.7200],[32.1000,34.8000],[32.3200,34.8600],[32.4300,34.9200],[32.6000,34.9500],[32.7900,35.0000]],
-  'כביש 5':   [[32.1300,34.8000],[32.1100,34.9200],[32.1000,35.0200],[32.1000,35.1200],[32.1000,35.1800]],
-  'כביש 6':   [[31.5500,34.7700],[31.7500,34.8500],[31.9500,34.9500],[32.1500,35.0200],[32.3500,35.0500],[32.4700,35.1000]],
-  'כביש 10':  [[30.8800,34.4200],[30.6000,34.5500],[30.2000,34.6500],[29.9000,34.7800],[29.6500,34.9200],[29.5500,34.9500]],
-  'כביש 25':  [[31.2500,34.7900],[31.3500,34.7000],[31.4200,34.5900],[31.5200,34.6000]],
-  'כביש 40':  [[31.2500,34.7900],[31.4500,34.7800],[31.6100,34.7600],[31.8100,34.7800],[31.9500,34.8200],[32.0500,34.8300]],
-  'כביש 41':  [[31.8000,34.6600],[31.8200,34.7400],[31.8500,34.8000],[31.8800,34.8400]],
-  'כביש 44':  [[32.0000,34.8300],[31.9500,34.9000],[31.9200,34.9700],[31.9000,35.0100]],
-  'כביש 60':  [[31.2500,34.8000],[31.5300,35.1000],[31.7100,35.1900],[31.9000,35.2100],[32.1300,35.2500],[32.4000,35.2900],[32.7000,35.3000]],
-  'כביש 444': [[32.0800,34.9500],[32.0200,34.9300],[31.9700,34.9200],[31.9300,34.9200]],
-  'כביש 461': [[32.0300,34.8500],[32.0300,34.8800],[32.0300,34.8900]],
-  'כביש 22':  [[32.7900,35.0400],[32.8100,35.0600],[32.8300,35.0700]],
-  'כביש 57':  [[32.3300,34.8600],[32.3200,34.9400],[32.3100,35.0000],[32.3100,35.0300]],
-  'כביש 65':  [[32.4300,34.9500],[32.4700,35.0500],[32.5200,35.1500],[32.5800,35.2500],[32.6100,35.2900]],
-  'כביש 66':  [[32.5800,35.1800],[32.5900,35.2400],[32.6100,35.2900]],
-  'כביש 70':  [[32.6300,35.1000],[32.7200,35.0800],[32.8200,35.1000],[32.9200,35.1000]],
-  'כביש 75':  [[32.7900,35.0000],[32.7400,35.1000],[32.7000,35.2000],[32.7000,35.2900]],
-  'כביש 89':  [[33.0100,35.1000],[33.0200,35.2500],[32.9900,35.4000],[32.9600,35.5000]],
-  'כביש 90':  [[29.5500,34.9500],[30.1000,35.1000],[30.8000,35.3500],[31.3000,35.4000],[31.9000,35.4800],[32.5000,35.5000],[32.8900,35.5400],[33.2100,35.5700],[33.2800,35.5800]],
-  'כביש 98':  [[32.7000,35.6100],[32.7500,35.6600],[32.8000,35.7000]],
-  'כביש 781': [[32.8100,35.0800],[32.8300,35.0900],[32.8400,35.1000]],
-  'כביש 804': [[32.9200,35.2500],[32.9600,35.3000],[32.9800,35.3300]],
-  'כביש 807': [[32.8400,35.5000],[32.8200,35.4500],[32.8100,35.4200]],
-  'כביש 866': [[32.9200,35.3000],[32.9500,35.4000],[32.9600,35.4900]],
-  'כביש 899': [[33.1000,35.5500],[33.1400,35.5700],[33.1700,35.5800]],
-  'כביש 8655':[[32.9700,35.3200],[32.9800,35.3300],[32.9900,35.3400]],
-  'כביש 8697':[[32.8400,35.6600],[32.8500,35.6800],[32.8600,35.6900]],
+// Approximate region polygons (lat/lon rings) for the regional heatmap, keyed by
+// the ROUTES[].section value. Each ring roughly traces Israel's outline within a
+// latitude band — accurate enough to read as the South/Central/North zone over real
+// map tiles, not survey-accurate borders. The fill color is the region's congestion
+// index (see _nciRegionDeviations); the keys must match the `section` strings.
+var REGION_GEO = {
+  'צפון': [[33.08,35.10],[33.28,35.58],[33.10,35.62],[32.70,35.57],[32.50,35.50],[32.50,35.00],[32.55,34.92],[32.83,34.95]],
+  'מרכז': [[32.55,34.92],[32.40,34.88],[32.08,34.76],[31.79,34.63],[31.55,34.50],[31.45,34.45],[31.45,35.40],[31.76,35.55],[32.20,35.57],[32.50,35.50],[32.50,35.00]],
+  'דרום': [[31.45,34.45],[31.45,35.40],[31.00,35.40],[30.50,35.15],[29.55,34.98],[29.55,34.95],[30.40,34.43],[31.10,34.27],[31.35,34.30]],
 };
-
-// Dev helper: log any ROUTES[].name missing from ROUTE_GEO and any orphan GEO keys.
-function _routeGeoCoverage() {
-  var names = {};
-  ROUTES.forEach(function(rt) {
-    names[rt.name] = true;
-    if (!ROUTE_GEO[rt.name]) Logger.log('ROUTE_GEO missing: ' + rt.name);
-  });
-  Object.keys(ROUTE_GEO).forEach(function(k) {
-    if (!names[k]) Logger.log('ROUTE_GEO orphan (no ROUTES entry): ' + k);
-  });
-  Logger.log('ROUTES=' + ROUTES.length + '  ROUTE_GEO=' + Object.keys(ROUTE_GEO).length);
-}
 
 // ═══ STYLING ══════════════════════════════════
 var C_HDR_BG = '#1F3864', C_HDR_FG = '#FFFFFF';
@@ -2084,24 +2051,25 @@ function _nciData(ss, baselines) {
   };
 }
 
-// ─── Heatmap: per-route color data + static/interactive map ───
+// ─── Heatmap: per-region color data + interactive map ───
 
-// Collapse win.rows (per route+direction) to one deviation value per route NAME.
-// Jam-weighted average across the route's directions — consistent with how the
-// national index itself is weighted in _nciData. devPct is null when no direction
-// had a usable baseline that window (→ rendered grey). Returns:
-//   { 'כביש 1': { devPct: <num|null>, jams: <int> }, ... }
-function _nciRouteDeviations(win) {
+// Collapse win.rows to one deviation value per REGION (section: דרום/מרכז/צפון).
+// Jam-weighted average across the region's routes — consistent with how the
+// national index itself is weighted in _nciData. devPct is null when no route in
+// the region had a usable baseline that window (→ rendered grey). Returns:
+//   { 'מרכז': { devPct: <num|null>, jams: <int> }, ... }
+function _nciRegionDeviations(win) {
   var acc = {};
   ((win && win.rows) || []).forEach(function(r) {
-    var a = acc[r.route] || (acc[r.route] = { num: 0, wj: 0, jams: 0, anyDev: false });
+    var sec = r.section || '—';
+    var a = acc[sec] || (acc[sec] = { num: 0, wj: 0, jams: 0, anyDev: false });
     a.jams += (r.jams || 0);
     if (r.devPct != null) { a.num += r.devPct * (r.jams || 1); a.wj += (r.jams || 1); a.anyDev = true; }
   });
   var out = {};
-  Object.keys(acc).forEach(function(name) {
-    var a = acc[name];
-    out[name] = { devPct: a.anyDev && a.wj > 0 ? _round1(a.num / a.wj) : null, jams: a.jams };
+  Object.keys(acc).forEach(function(sec) {
+    var a = acc[sec];
+    out[sec] = { devPct: a.anyDev && a.wj > 0 ? _round1(a.num / a.wj) : null, jams: a.jams };
   });
   return out;
 }
@@ -2121,14 +2089,28 @@ function _latestWindowWithRows(ss) {
   return null;
 }
 
+// Working web-app URL for menu/email links: the hardcoded anonymous /exec
+// (falls back to getUrl()), plus a cache-busting token so a stale edge-cached
+// response is never served. `token` makes the link stable per send when given.
+function _nciMapUrl(token) {
+  var base = NCI_MAP_WEBAPP_URL;
+  if (!base) { try { base = ScriptApp.getService().getUrl() || ''; } catch (_) { base = ''; } }
+  if (!base) return '';
+  if (!token) {
+    try { token = Utilities.formatDate(new Date(), Session.getScriptTimeZone() || 'Asia/Jerusalem', 'yyyyMMddHHmm'); }
+    catch (_) { token = 'v'; }
+  }
+  return base + (base.indexOf('?') >= 0 ? '&' : '?') + 't=' + encodeURIComponent(token);
+}
+
 // ─── Interactive heatmap (Web App) ───
 // Served at the web-app URL after Deploy ▸ New deployment ▸ Web app.
 function doGet(e) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var win = _latestWindowWithRows(ss);
   var payload = {
-    geo: ROUTE_GEO,
-    devs: win ? _nciRouteDeviations(win) : {},
+    regions: REGION_GEO,
+    devs: win ? _nciRegionDeviations(win) : {},
     meta: win ? { key: win.key, indexPct: win.indexPct, range: _winRangeLabel(win.key) } : null,
   };
   var tmpl = HtmlService.createTemplateFromFile('Map');
@@ -2140,16 +2122,25 @@ function doGet(e) {
 
 function menuOpenCongestionMap() {
   var ui = SpreadsheetApp.getUi();
-  var url = ScriptApp.getService().getUrl();
+  var url = _nciMapUrl();
   if (!url) {
     ui.alert('המפה האינטראקטיבית עדיין לא פורסמה.\n\nבעורך הסקריפט: Deploy ▸ New deployment ▸ Web app, ואז נסה שוב.');
     return;
   }
-  ui.showModalDialog(
-    HtmlService.createHtmlOutput(
-      '<script>window.open(' + JSON.stringify(url) + ',"_blank");google.script.host.close();</script>')
-      .setWidth(120).setHeight(60),
-    'פותח מפה...');
+  // A real <a> the user clicks — an auto window.open() on dialog-load is blocked
+  // by the popup blocker (no user gesture). The link opens in a new tab on click.
+  var safe = url.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+  var html = HtmlService.createHtmlOutput(
+    '<div dir="rtl" style="font-family:Arial,Helvetica,sans-serif;text-align:center;padding:18px 16px">' +
+    '<a href="' + safe + '" target="_blank" rel="noopener" ' +
+    'style="display:inline-block;background:#1F3864;color:#fff;text-decoration:none;' +
+    'padding:12px 24px;border-radius:8px;font-weight:bold;font-size:15px">🗺️ פתח את מפת החום</a>' +
+    '<p style="color:#64748b;font-size:12px;margin:14px 0 4px">נפתח בלשונית חדשה. אם לא — העתק את הכתובת:</p>' +
+    '<input readonly onclick="this.select()" value="' + safe + '" ' +
+    'style="width:100%;box-sizing:border-box;font-size:11px;padding:6px;border:1px solid #cbd5e1;border-radius:6px">' +
+    '</div>')
+    .setWidth(340).setHeight(170);
+  ui.showModalDialog(html, 'מפת חום ארצית');
 }
 
 // ─── _nci_history (permanent log of every reading) ───
@@ -2474,8 +2465,7 @@ function _sendNCIEmail(nci, win, history) {
   } catch (_) {}
   var st = _nciStatus(win.indexPct);
   var subject = '🚦 מדד ארצי — ' + win.key + ' ' + nci.date + ': ' + _nciFmtPct(win.indexPct) + ' · ' + st.label;
-  var mapUrl = '';
-  try { mapUrl = ScriptApp.getService().getUrl() || ''; } catch (_) {}
+  var mapUrl = _nciMapUrl(nci.date + '-' + win.key);   // stable per send, cache-busted
   MailApp.sendEmail({
     to: to.join(','),
     subject: subject,
