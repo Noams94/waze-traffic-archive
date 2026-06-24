@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html dir="rtl" lang="he">
+<head>
+  <meta charset="utf-8">
+  <title>מפת חום — מדד תנועה ארצי</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+  <style>
+    html, body { margin: 0; height: 100%; font-family: Arial, Helvetica, sans-serif; }
+    #map { position: absolute; inset: 0; }
+    .panel {
+      position: absolute; top: 12px; right: 12px; z-index: 1000;
+      background: rgba(255,255,255,0.95); border: 1px solid #e2e8f0;
+      border-radius: 10px; padding: 12px 14px; box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+      max-width: 230px; color: #1f2937;
+    }
+    .panel h1 { font-size: 15px; margin: 0 0 4px; }
+    .panel .sub { font-size: 12px; color: #475569; margin-bottom: 8px; }
+    .panel .idx { font-size: 26px; font-weight: bold; margin: 2px 0 8px; }
+    .legend div { font-size: 12px; line-height: 20px; }
+    .legend i { display: inline-block; width: 14px; height: 6px; border-radius: 3px;
+                margin-left: 7px; vertical-align: middle; }
+    .empty { font-size: 12px; color: #b45309; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="panel">
+    <h1>🚦 מפת חום ארצית</h1>
+    <div class="sub" id="sub">—</div>
+    <div class="idx" id="idx"></div>
+    <div class="legend">
+      <div><i style="background:#C00000"></i>חריג מאוד (&gt;50%)</div>
+      <div><i style="background:#BF6000"></i>עמוס (&gt;25%)</div>
+      <div><i style="background:#996600"></i>מתון (&gt;10%)</div>
+      <div><i style="background:#006100"></i>תקין (±10%)</div>
+      <div><i style="background:#1E40AF"></i>טוב מהרגיל</div>
+      <div><i style="background:#475569"></i>אין נתונים</div>
+    </div>
+    <div class="empty" id="empty"></div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script>
+    var payload = <?!= data ?>;
+
+    // Mirror of _nciStatus thresholds/colors (single source of truth lives server-side).
+    function colorFor(dev) {
+      if (dev == null) return '#475569';
+      if (dev > 50)  return '#C00000';
+      if (dev > 25)  return '#BF6000';
+      if (dev > 10)  return '#996600';
+      if (dev >= -10) return '#006100';
+      return '#1E40AF';
+    }
+    function labelFor(dev) {
+      if (dev == null) return 'אין נתונים';
+      if (dev > 50)  return 'חריג מאוד';
+      if (dev > 25)  return 'עמוס';
+      if (dev > 10)  return 'מתון';
+      if (dev >= -10) return 'תקין';
+      return 'טוב מהרגיל';
+    }
+    function fmtPct(v) { return (v > 0 ? '+' : '') + (Math.round(v * 10) / 10) + '%'; }
+
+    var map = L.map('map').setView([31.4, 35.0], 8);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 18,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+    }).addTo(map);
+
+    var geo = payload.geo || {}, devs = payload.devs || {};
+    var bounds = [];
+    Object.keys(geo).forEach(function(name) {
+      var pts = geo[name];
+      if (!pts || !pts.length) return;
+      var d = devs[name] ? devs[name].devPct : null;
+      var jams = devs[name] ? devs[name].jams : 0;
+      var line = L.polyline(pts, { color: colorFor(d), weight: 5, opacity: 0.9 }).addTo(map);
+      var devTxt = d == null ? 'אין נתונים' : fmtPct(d) + ' · ' + labelFor(d);
+      line.bindPopup('<b>' + name + '</b><br>' + devTxt + '<br>' + jams + ' פקקים');
+      pts.forEach(function(p) { bounds.push(p); });
+    });
+    if (bounds.length) map.fitBounds(bounds, { padding: [30, 30] });
+
+    var meta = payload.meta;
+    if (meta) {
+      document.getElementById('sub').textContent = 'מסגרת ' + meta.key + ' (' + meta.range + ')';
+      var idx = document.getElementById('idx');
+      idx.textContent = meta.indexPct == null ? '' : fmtPct(meta.indexPct);
+      idx.style.color = colorFor(meta.indexPct);
+    } else {
+      document.getElementById('sub').textContent = 'אין נתונים חיים';
+      document.getElementById('empty').textContent =
+        'לא נמצא חלון עם נתוני מסלולים. הרץ "חשב מדד ארצי עכשיו" וטען נתונים עדכניים.';
+    }
+  </script>
+</body>
+</html>
