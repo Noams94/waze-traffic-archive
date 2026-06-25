@@ -1788,13 +1788,13 @@ var ROUTES = [
   {section:'מרכז',name:'כביש 4',from:'אשדוד',to:'חיפה',distance_km:120,free_flow_min:80,streets_dir1:['4 צפון'],streets_dir2:['4 דרום'],dir1_label:'אשדוד → חיפה (צפון)',dir2_label:'חיפה → אשדוד (דרום)'},
   {section:'מרכז',name:'כביש 5',from:'ת"א',to:'אריאל',distance_km:40,free_flow_min:30,streets_dir1:['5 מזרח'],streets_dir2:['5 מערב'],dir1_label:'ת"א → אריאל (מזרח)',dir2_label:'אריאל → ת"א (מערב)'},
   {section:'מרכז',name:'כביש 6',from:'קריית גת',to:'חדרה',distance_km:130,free_flow_min:65,streets_dir1:['6 צפון'],streets_dir2:['6 דרום'],dir1_label:'ק. גת → חדרה (צפון)',dir2_label:'חדרה → ק. גת (דרום)'},
-  {section:'מרכז',name:'כביש 41',from:'אשדוד',to:'ראשל"צ',distance_km:20,free_flow_min:18,streets_dir1:['41 מזרח'],streets_dir2:['41 מערב'],dir1_label:'אשדוד → ראשל"צ (מזרח)',dir2_label:'ראשל"צ → אשדוד (מערב)'},
+  {section:'דרום',name:'כביש 41',from:'אשדוד',to:'ראשל"צ',distance_km:20,free_flow_min:18,streets_dir1:['41 מזרח'],streets_dir2:['41 מערב'],dir1_label:'אשדוד → ראשל"צ (מזרח)',dir2_label:'ראשל"צ → אשדוד (מערב)'},
   {section:'מרכז',name:'כביש 44',from:'אשדוד',to:'מודיעין',distance_km:40,free_flow_min:35,streets_dir1:['44 צפון'],streets_dir2:['44 דרום'],dir1_label:'אשדוד → מודיעין (צפון)',dir2_label:'מודיעין → אשדוד (דרום)'},
   {section:'מרכז',name:'כביש 60',from:'באר שבע',to:'נצרת',distance_km:200,free_flow_min:180,streets_dir1:['60'],streets_dir2:[],dir1_label:'שני הכיוונים (מעורב)',dir2_label:''},
   {section:'מרכז',name:'כביש 444',from:'ראש העין',to:'נחשונים',distance_km:15,free_flow_min:12,streets_dir1:['444 צפון'],streets_dir2:['444 דרום'],dir1_label:'נחשונים → ר"ע (צפון)',dir2_label:'ר"ע → נחשונים (דרום)'},
   {section:'מרכז',name:'כביש 461',from:'אור יהודה',to:'יהוד',distance_km:8,free_flow_min:8,streets_dir1:['461 מזרח'],streets_dir2:['461 מערב'],dir1_label:'אור יהודה → יהוד (מזרח)',dir2_label:'יהוד → אור יהודה (מערב)'},
   {section:'צפון',name:'כביש 22',from:'חיפה מפרץ',to:'חיפה כרמל',distance_km:12,free_flow_min:12,streets_dir1:['22 צפון'],streets_dir2:['22 דרום'],dir1_label:'דרום → צפון',dir2_label:'צפון → דרום'},
-  {section:'צפון',name:'כביש 57',from:'נתניה',to:'טול כרם',distance_km:22,free_flow_min:20,streets_dir1:['57 מזרח'],streets_dir2:['57 מערב'],dir1_label:'נתניה → מזרח',dir2_label:'מזרח → נתניה'},
+  {section:'מרכז',name:'כביש 57',from:'נתניה',to:'טול כרם',distance_km:22,free_flow_min:20,streets_dir1:['57 מזרח'],streets_dir2:['57 מערב'],dir1_label:'נתניה → מזרח',dir2_label:'מזרח → נתניה'},
   {section:'צפון',name:'כביש 65',from:'חדרה',to:'עפולה',distance_km:55,free_flow_min:45,streets_dir1:['65 מזרח'],streets_dir2:['65 מערב'],dir1_label:'חדרה → עפולה (מזרח)',dir2_label:'עפולה → חדרה (מערב)'},
   {section:'צפון',name:'כביש 66',from:'מגידו',to:'עפולה',distance_km:20,free_flow_min:18,streets_dir1:['66 צפון'],streets_dir2:['66 דרום'],dir1_label:'מגידו → עפולה (צפון)',dir2_label:'עפולה → מגידו (דרום)'},
   {section:'צפון',name:'כביש 70',from:'חיפה',to:'עכו',distance_km:25,free_flow_min:20,streets_dir1:['70 צפון'],streets_dir2:['70 דרום'],dir1_label:'חיפה → עכו (צפון)',dir2_label:'עכו → חיפה (דרום)'},
@@ -1811,15 +1811,17 @@ var ROUTES = [
   {section:'צפון',name:'כביש 8697',from:'רמות (גולן)',to:'רמות',distance_km:5,free_flow_min:5,streets_dir1:['8697'],streets_dir2:[],dir1_label:'שני הכיוונים',dir2_label:''},
 ];
 
-// Approximate region polygons (lat/lon rings) for the regional heatmap, keyed by
-// the ROUTES[].section value. Each ring roughly traces Israel's outline within a
-// latitude band — accurate enough to read as the South/Central/North zone over real
-// map tiles, not survey-accurate borders. The fill color is the region's congestion
-// index (see _nciRegionDeviations); the keys must match the `section` strings.
+// Region polygons (lat/lon rings) for the regional heatmap, keyed by the
+// ROUTES[].section value. These follow Israel's official administrative districts
+// grouped into three: צפון = Northern + Haifa, מרכז = Central + Tel Aviv + Jerusalem
+// (the eastern bulge is the Jerusalem corridor), דרום = Southern (Ashdod and south).
+// Simplified — coastal split lines verified against the districts (Center/North ≈
+// Hadera 32.38, Center/South ≈ north of Ashdod 31.85); the eastern edge follows the
+// Jordan rift rather than cutting the Green Line. Keys must match the section strings.
 var REGION_GEO = {
-  'צפון': [[33.08,35.10],[33.28,35.58],[33.10,35.62],[32.70,35.57],[32.50,35.50],[32.50,35.00],[32.55,34.92],[32.83,34.95]],
-  'מרכז': [[32.55,34.92],[32.40,34.88],[32.08,34.76],[31.79,34.63],[31.55,34.50],[31.45,34.45],[31.45,35.40],[31.76,35.55],[32.20,35.57],[32.50,35.50],[32.50,35.00]],
-  'דרום': [[31.45,34.45],[31.45,35.40],[30.90,35.35],[30.10,35.10],[29.55,34.95],[30.50,34.43],[31.10,34.30],[31.30,34.33]],
+  'צפון': [[32.38,34.88],[32.55,34.90],[32.83,34.97],[33.08,35.10],[33.28,35.58],[33.10,35.65],[32.70,35.62],[32.50,35.50],[32.38,35.28]],
+  'מרכז': [[32.38,34.88],[32.38,35.28],[32.10,35.40],[31.85,35.35],[31.70,35.30],[31.70,34.95],[31.85,34.80],[31.85,34.68],[32.08,34.77],[32.33,34.85]],
+  'דרום': [[31.85,34.68],[31.85,34.80],[31.70,34.95],[31.70,35.30],[31.50,35.45],[31.00,35.40],[30.10,35.10],[29.55,34.95],[30.50,34.43],[31.10,34.30],[31.55,34.45]],
 };
 
 // ═══ STYLING ══════════════════════════════════
