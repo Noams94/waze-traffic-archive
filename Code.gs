@@ -814,7 +814,16 @@ function _scheduledFetch() {
   var url = _getConfig('fetch_url');
   if (!url) return;
   var headers = _getConfig('fetch_headers') || '';
-  var result = fetchFromUrl(url, headers);
+  var result;
+  try {
+    result = fetchFromUrl(url, headers);
+  } catch (e) {
+    // fetchFromUrl converts almost every failure into a result object, but a
+    // throw here (e.g. a post-fetch helper) would otherwise leave NO row in
+    // _fetch_log and surface only in the Apps Script execution log. Capture it
+    // as a real error row so the log never looks clean when a run actually failed.
+    result = { ok: false, error: 'חריגה לא צפויה: ' + ((e && e.message) || e) };
+  }
   try {
     var ss = SpreadsheetApp.getActiveSpreadsheet();
     var log = ss.getSheetByName('_fetch_log');
@@ -829,7 +838,12 @@ function _scheduledFetch() {
       result.jams || '',
       result.error || '',
     ]);
-  } catch(e) {}
+  } catch (e) {
+    // Even writing the log failed (sheet locked, quota, etc.). Don't swallow it
+    // silently — make it visible in the execution log so a stalled schedule is
+    // diagnosable instead of looking idle.
+    console.error('_scheduledFetch: failed to write _fetch_log: ' + ((e && e.message) || e));
+  }
 }
 
 function getScheduleConfig() {
