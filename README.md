@@ -8,7 +8,7 @@ Google Sheets + Apps Script tool for archiving and analyzing raw Waze API JSON s
 - **Accumulates** a 30-day rolling raw archive (`raw_data`) + a **permanent aggregated archive** (`_baseline_archive`) that survives pruning
 - **Filters** the archive by date range, hour-of-day, and day-of-week
 - **Computes baselines** from the permanent archive (per route × direction × **hour** × **weekday/weekend**) with neighbor-window fallback (±1h, ±2h). When no historical data exists for a time-point, reports "אין מספיק נתונים" rather than comparing against an irrelevant baseline.
-- **Renders** 8 sheets driven by an interactive sidebar:
+- **Renders** 10 sheets driven by an interactive sidebar:
   - 🎯 לוח מחוונים (Dashboard) — KPI strip, top 10 worst routes, best 5, section breakdown, analysis quality indicator
   - סיכום מסלולים — per-route summary with deviation vs historical average
   - פירוט לפי שעה — hour-by-hour breakdown with same-time comparisons (weekday vs weekend separated)
@@ -16,8 +16,14 @@ Google Sheets + Apps Script tool for archiving and analyzing raw Waze API JSON s
   - חריגות — anomaly detection (1.5σ + low speed + high level)
   - פירוט פקקים — full jam log
   - אגרגציה לאורך זמן — long-term trends from the permanent archive
+  - 🚦 מדד ארצי — National Traffic Index (NCI) one-pager: one weighted number per rush window + recent-readings trend
+  - פירוט לפי מסגרת זמן — the per-route detail behind the index (morning/evening windows)
   - מקרא ומתודולוגיה — legend + full methodology documentation
+- **Computes a National Traffic Index (NCI)** twice a day — morning window 06:00–10:00 (runs ~10:00) and evening 16:00–19:00 (runs ~20:00): jam-weighted average of per-route deviation % vs the permanent baseline, logged forever to `_nci_history`, with a low-confidence caveat on thin windows (< 80 jams or < 12 routes)
+- **Emails a digest** after each NCI run — headline index, 5 worst routes, recent trend, an inline regional heatmap image (Geoapify Static Maps, optional free key) and a link to an interactive Leaflet heatmap served as an Apps Script web app (`Map.html`). Recipients and on/off are menu-configurable
+- **Classifies every jam** as חירום (emergency) / שגרה (routine) via explicit date-time windows (`EMERGENCY_WINDOWS` in `Code.gs`); emergency hours are **excluded from baselines**, so deviation is always measured against routine traffic
 - **Auto-fetches** from a configured URL on a schedule (30 min / hourly / 4 hr / daily) — schedule config persists in the spreadsheet itself, with a flow for re-activating the trigger when switching Google accounts
+- **Auto-archives daily** at 03:00 (incremental CSV export to Drive + pruning) via chunked resumable background jobs, with watchdog triggers and self-healing retries when the sheet approaches Google's 10M-cell cap
 
 ## Files
 
@@ -25,6 +31,7 @@ Google Sheets + Apps Script tool for archiving and analyzing raw Waze API JSON s
 |------|---------|
 | `Code.gs` | Apps Script source — paste into the Apps Script editor as the main file |
 | `Sidebar.html` | Apps Script HTML — paste into a new HTML file named `Sidebar` |
+| `Map.html` | Apps Script HTML — the interactive regional heatmap (paste into a new HTML file named `Map`; served via a Web App deployment) |
 | `waze_analyzer.py` | Original Python CLI version (still works standalone — `python waze_analyzer.py input.json output.xlsx`) |
 | `waze_dashboard.jsx` | Earlier React/Recharts dashboard (reference; superseded by the Sheets dashboard) |
 | `waze_routes_v2.xlsx` | Sample Excel output from the Python version |
@@ -35,8 +42,11 @@ Google Sheets + Apps Script tool for archiving and analyzing raw Waze API JSON s
 2. Open `Extensions → Apps Script`
 3. Replace the default `Code.gs` content with the contents of `Code.gs` from this repo
 4. Click `+` → `HTML` → name it `Sidebar` → paste in the contents of `Sidebar.html`
-5. Save (`Cmd+S`) and reload the Sheet
-6. The menu `🚦 Waze` will appear → `פתח סרגל צד...`
+5. Click `+` → `HTML` → name it `Map` → paste in the contents of `Map.html`
+6. Save (`Cmd+S`) and reload the Sheet
+7. The menu `🚦 Waze` will appear → `פתח סרגל צד...`
+8. *(Optional, for the interactive heatmap link)* In the script editor: `Deploy ▸ New deployment ▸ Web app` (access: anyone), then set the resulting `/exec` URL as `NCI_MAP_WEBAPP_URL` in `Code.gs`
+9. *(Optional, for the heatmap image in the email)* Menu `🚦 Waze → 🔑 הגדר מפתח מפת חום למייל (Geoapify)` — free key, no credit card
 
 ## Usage
 
@@ -49,7 +59,12 @@ Google Sheets + Apps Script tool for archiving and analyzing raw Waze API JSON s
 
 ### Filter & rebuild analysis
 - Sidebar → 🔍 סינון tab → pick date range / hours / days → "החל סינון ובנה גיליונות"
-- The 8 analysis sheets rebuild from the filtered archive
+- The 9 analysis sheets rebuild from the filtered archive
+
+### National Traffic Index (NCI)
+- Menu `🚦 Waze → ⏰ התקן תזמון מדד ארצי` installs the twice-daily triggers (also auto-installed on open); `🚦 חשב מדד ארצי עכשיו` runs it on demand
+- Email digest: on by default after every run — toggle with `📧 הפעל/כבה מייל מדד ארצי`, set recipients with `✉️ הגדר נמעני מייל מדד...`, verify with `📤 שלח מייל מדד עכשיו (בדיקה)` and `🧪 בדוק תמונת מפה למייל`
+- `🗺️ פתח מפת חום אינטראקטיבית` opens the Leaflet web-app map
 
 ### Reset
 - Menu `🚦 Waze → מחק את כל הנתונים` (with confirmation)
@@ -69,6 +84,8 @@ Sheets fall into three categories: **rebuilt on filter apply**, **rebuilt on upl
 | חריגות | Local outlier detection (1.5σ / speed / level) |
 | פירוט פקקים | Full jam log |
 | מקרא ומתודולוגיה | Legend + methodology guide (first tab) |
+| 🚦 מדד ארצי | NCI one-pager — also refreshed by the twice-daily NCI triggers; filter-independent (always latest window vs full history) |
+| פירוט לפי מסגרת זמן | Window-level per-route detail feeding the index — same refresh behavior as the NCI tab |
 
 ### Rebuilt only on upload (not on filter apply)
 
@@ -80,12 +97,14 @@ Sheets fall into three categories: **rebuilt on filter apply**, **rebuilt on upl
 
 | Sheet | Persistence | Purpose |
 |-------|-------------|---------|
-| `raw_data` | append-only, auto-pruned > 30 days | one row per jam per snapshot. Extra cols: `route_name`, `dir_ix`, `archived` (flag) |
+| `raw_data` | append-only, auto-pruned > 30 days (plus a row-cap safety prune) | one row per jam per snapshot. Extra cols: `route_name`, `dir_ix`, `archived` (flag), `period` (חירום/שגרה) |
 | `_baseline_archive` | hidden, **never pruned** | aggregated counters per `(route, dir, date, hour)` — `n, sum_delay_s, sum_speed, sum_level`. Source of truth for all historical baselines. |
+| `_nci_history` | hidden, **never pruned** | one row per NCI reading — `run_ts, date, window, daytype, index_pct, n_jams, n_routes, period`. Feeds the trend on the slide and in the email. |
 | `מקור` | append-only, auto-pruned > 30 days | log of every upload (`startTime`, jam count) |
 | `ארכיון נפרד` | append-only | log of CSV exports to Drive (filename, date range, link) |
-| `_config` | hidden | URL, headers, interval, trigger owner — persists across users/devices |
+| `_config` | hidden | URL, headers, interval, trigger owner, NCI email/map settings — persists across users/devices |
 | `_fetch_log` | hidden | log of every scheduled fetch (timestamp, user, status, error) |
+| `_archive_slice_log` | hidden | diagnostics for the chunked exporter (chunks, timings, exit reason per slice) |
 | `_filter` | hidden, overwritten each filter | last applied filter (JSON blob) |
 
 **Key principle:** filtering only affects which `raw_data` rows feed the analysis tabs. Baselines for deviation calculations always come from the full `_baseline_archive` regardless of the filter — so "what I'm seeing in my chosen range" is always compared against "everything I know historically."
@@ -109,6 +128,8 @@ This section mirrors the in-sheet "מקרא ומתודולוגיה" tab. It expl
 | חריגות | Individual jams that stand out **within the current filter**. Criterion is local statistics (1.5σ above mean for the route×direction, or speed < 5 km/h, or level ≥ 4) — not historical. Sorted by severity (קריטי → גבוה → בינוני) then by delay size. |
 | פירוט פקקים | Full raw log of every jam in the current filter — one row per jam, sorted route → direction → time. For deep-dive investigation. |
 | אגרגציה לאורך זמן | Direct view of `_baseline_archive` — full history, not just 30 days. One row per (date × route × direction × hour). Sorted newest first. Capped at 5,000 most recent rows in the display. Use for long-term trend analysis. |
+| 🚦 מדד ארצי | The NCI slide: one big weighted deviation number for the latest closed rush window, per-window table, recent-readings trend with a sparkline, and a thin-sample caveat when the window is sparse. |
+| פירוט לפי מסגרת זמן | Same comparison as פירוט לפי שעה, but hours are bucketed into the rush windows (בוקר 06–10 / ערב 16–19). One row per route × direction per window, with a summary row showing the window's weighted index. Filter-independent. |
 | מקרא ומתודולוגיה | This methodology document, available in-sheet. |
 
 ### How baselines are computed
@@ -122,6 +143,8 @@ route × direction × hour-of-day × daytype
 Where `daytype ∈ { weekday (א'–ה'), weekend (ו'–ש') }`. The aggregation happens in the permanent `_baseline_archive` sheet — every new jam upserts into the matching `(route, dir, date, hour)` cell, accumulating `n` and `sum_delay_s` forever. Daytype is derived from date at read time.
 
 A cell is considered "usable" only when **n ≥ 3** historical samples have accumulated for it.
+
+**Emergency exclusion:** hours falling inside a declared emergency window (`EMERGENCY_WINDOWS` in `Code.gs`, half-open `[from, to)` local time) are skipped when baselines are built, so deviation is always measured against routine traffic. Every jam and every NCI reading also carries a `period` label (חירום/שגרה); existing rows can be re-labeled after declaring a new window via `מתקדם → 🔴 סווג חירום/שגרה לנתונים קיימים`.
 
 ### Fallback policy (neighbor-window expansion)
 
@@ -170,6 +193,16 @@ Severity:
 
 The baseline tabs answer *"is this worse than usual?"*. The anomaly tab answers *"which jams stand out from the rest of what I'm seeing right now?"*. Complementary, not redundant.
 
+### National Traffic Index (NCI)
+
+One national number per rush window: the **jam-weighted average** of the per-route/per-hour deviation % (same comparison as פירוט לפי שעה) across all routes, bucketed into the window. Positive = heavier than routine, negative = lighter.
+
+- **Windows:** בוקר 06:00–10:00 (computed ~10:00) · ערב 16:00–19:00 (computed ~20:00), daily triggers.
+- **History:** every reading is appended to the permanent `_nci_history` sheet (deduped per date × window) and drives the trend on the slide and in the email.
+- **Low confidence:** a window with < 80 jams or < 12 contributing routes gets a "מדגם קטן" caveat next to the number (common on weekends) — shown, never hidden.
+- **Email digest:** sent after each run (default on; recipients default to the sheet owner) — headline pill, 5 worst routes, same-window trend, inline regional heatmap image (Geoapify) and a link to the interactive map.
+- **Regional heatmap:** the three regions (צפון/מרכז/דרום, drawn from Israel's official administrative districts grouped into three) are colored by the region's jam-weighted deviation for the window. Interactive version = `Map.html` web app; static version = Geoapify Static Maps PNG embedded in the email.
+
 ### Color scale for deviation columns
 
 | Color | Meaning |
@@ -190,8 +223,10 @@ The baseline tabs answer *"is this worse than usual?"*. The anomaly tab answers 
 ### Refresh flow
 
 - **On every upload** (manual or scheduled): the JSON is parsed, deduplicated against `מקור` by `startTime`, appended to `raw_data`, and immediately upserted into `_baseline_archive`. The "אגרגציה לאורך זמן" tab is rebuilt.
-- **On every "החל סינון"**: the 7 analysis tabs are wiped and redrawn from the filtered `raw_data`. Baselines are read from the full `_baseline_archive` (not the filter).
-- **Pruning**: `raw_data` rows older than 30 days are exported to Drive as CSV (resumable, chunked) and then deleted. `_baseline_archive` is never pruned.
+- **On every "החל סינון"**: the 9 analysis tabs are wiped and redrawn from the filtered `raw_data`. Baselines are read from the full `_baseline_archive` (not the filter).
+- **Twice a day** (~10:00 / ~20:00): the NCI is computed, appended to `_nci_history`, both NCI tabs are rebuilt and the email digest is sent.
+- **Daily at 03:00**: incremental CSV export to Drive + pruning (toggle via `🗓️ הפעל/כבה גיבוי יומי`).
+- **Pruning**: `raw_data` rows older than 30 days are exported to Drive as CSV (resumable, chunked) and then deleted; a row-cap safety prune also fires as the sheet nears Google's 10M-cell limit. `_baseline_archive` and `_nci_history` are never pruned.
 - **Migration**: existing data from before the archive existed can be backfilled via **🚦 Waze → 🔄 העבר נתונים קיימים לארכיון אגרגטיבי**.
 
 ### Glossary
@@ -199,6 +234,8 @@ The baseline tabs answer *"is this worse than usual?"*. The anomaly tab answers 
 | Term | Meaning |
 |------|---------|
 | daytype | `weekday` (א'–ה') or `weekend` (ו'–ש') |
+| period | `חירום` (emergency) or `שגרה` (routine) — set by explicit date-time windows in `EMERGENCY_WINDOWS`; emergency hours are excluded from baselines |
+| NCI | National Traffic Index — jam-weighted national deviation % for a rush window (בוקר/ערב) |
 | jam | A single Waze jam event — one row in `raw_data` |
 | snapshot | One full pull from the Waze API (dozens to hundreds of jams) |
 | baseline | The historical average that current values are compared against |
