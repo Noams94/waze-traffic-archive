@@ -658,10 +658,14 @@ function getStatus() {
   var snapCount = sources && sources.getLastRow() > 1 ? sources.getLastRow() - 1 : 0;
   var jamCount = raw.getLastRow() - 1;
 
-  // Date range from raw data
-  var dates = raw.getRange(2, 1, jamCount, 1).getValues().map(function(r){ return r[0]; });
-  var minD = dates.reduce(function(a,b){ return a<b?a:b; }, dates[0]);
-  var maxD = dates.reduce(function(a,b){ return a>b?a:b; }, dates[0]);
+  // Date range from raw data. raw_data is kept in chronological order
+  // (append-only; menuRepairRawDataOrder restores the invariant), so the
+  // first and last rows are enough — no need to load a 450K-row column
+  // every time the sidebar polls status.
+  var firstTs = raw.getRange(2, 1).getValue();
+  var lastTs  = raw.getRange(raw.getLastRow(), 1).getValue();
+  var minD = firstTs < lastTs ? firstTs : lastTs;
+  var maxD = firstTs < lastTs ? lastTs : firstTs;
 
   return {
     snapshots: snapCount,
@@ -990,11 +994,15 @@ function _upsertBaselineArchive(ss, jamObjs) {
   var n = s.getLastRow() - 1;
   var existing = n > 0 ? s.getRange(2, 1, n, BASELINE_COLS.length).getValues() : [];
 
-  // index existing rows by composite key for O(1) lookup
+  // index existing rows by composite key for O(1) lookup.
+  // _ymd(r[2]): Sheets may coerce the stored 'yyyy-MM-dd' string into a Date,
+  // and a Date stringifies to a long form that never matches the incoming
+  // bucket key — every upsert would then append a duplicate row instead of
+  // incrementing the existing counters.
   var idx = {};
   for (var i = 0; i < existing.length; i++) {
     var r = existing[i];
-    idx[r[0] + '::' + r[1] + '::' + r[2] + '::' + r[3]] = i;
+    idx[r[0] + '::' + r[1] + '::' + _ymd(r[2]) + '::' + r[3]] = i;
   }
 
   // bucket incoming jams
@@ -1079,10 +1087,14 @@ function _catchUpBaselineArchive(ss, raw, maxRows) {
 
   _upsertBaselineArchive(ss, jamObjs);
 
-  // Flag rows as archived (and write back resolved route_name/dir_ix if missing)
+  // Flag rows as archived (and write back resolved route_name/dir_ix if missing).
+  // One batched write over cols 16-18 for the whole scanned block — a per-row
+  // setValues here made the migration crawl on large raw_data.
+  var flagCols = values.map(function(r) { return [r[15], r[16], r[17]]; });
   rowsToFlag.forEach(function(rf) {
-    raw.getRange(rf.sheetRow, 16, 1, 3).setValues([[rf.routeName, rf.dirIx, true]]);
+    flagCols[rf.sheetRow - 2] = [rf.routeName, rf.dirIx, true];
   });
+  raw.getRange(2, 16, flagCols.length, 3).setValues(flagCols);
   return jamObjs.length;
 }
 
@@ -1205,7 +1217,10 @@ function _deleteArchiveContinuationTriggers() {
   }
 }
 
+// Zero-pad to width w (default 2). Keep this the ONLY _pad in the project —
+// a second declaration would silently shadow it and drop the width argument.
 function _pad(n, w) {
+  w = w || 2;
   var s = String(n);
   while (s.length < w) s = '0' + s;
   return s;
@@ -1821,7 +1836,7 @@ var ROUTES = [
 var REGION_GEO = {
   'צפון': [[32.38,34.88],[32.55,34.90],[32.83,34.97],[33.08,35.10],[33.28,35.58],[33.10,35.65],[32.70,35.62],[32.50,35.50],[32.38,35.28]],
   'מרכז': [[32.38,34.88],[32.38,35.28],[32.10,35.40],[31.85,35.35],[31.70,35.30],[31.70,34.95],[31.85,34.80],[31.85,34.68],[32.08,34.77],[32.33,34.85]],
-  'דרום': [[31.85,34.68],[31.85,34.80],[31.70,34.95],[31.70,35.30],[31.50,35.45],[31.00,35.40],[30.10,35.10],[29.55,34.95],[30.50,34.43],[31.10,34.30],[31.55,34.45]],
+  'דרום': [[31.83,34.67],[31.65,35.10],[31.65,35.45],[31.00,35.40],[30.10,35.10],[29.55,34.95],[30.55,34.42],[31.50,34.45]],
 };
 
 // ═══ STYLING ══════════════════════════════════
@@ -1871,6 +1886,37 @@ function _secRow(sheet, row, ncols, text) {
        .setBackground(C_SEC_BG).setFontColor(C_SEC_FG)
        .setFontWeight('bold').setHorizontalAlignment('right');
 }
+// Batched data-block writer: values + alternating backgrounds in two API calls
+// instead of one setValues per row (a thousands-row sheet used to cost
+// thousands of calls). Rows where (sheetRow % 2 === altParity) get C_ALT.
+function _writeDataBlock(sheet, startRow, out, altParity) {
+  if (!out.length) return;
+  var nc = out[0].length;
+  var rng = sheet.getRange(startRow, 1, out.length, nc);
+  rng.setValues(out).setFontFamily('Arial').setFontSize(10).setHorizontalAlignment('center');
+  var bgs = out.map(function(_, ri) {
+    var alt = (startRow + ri) % 2 === altParity ? C_ALT : null;
+    var rowBg = [];
+    for (var c = 0; c < nc; c++) rowBg.push(alt);
+    return rowBg;
+  });
+  rng.setBackgrounds(bgs);
+}
+// Batched single-column styling from an array of {bg,fg,bold}|null per row
+// (null = keep the row's alternating background). Pairs with _writeDataBlock.
+function _styleColumn(sheet, startRow, col, styles, altParity) {
+  if (!styles.length) return;
+  var bg = [], fc = [], fw = [];
+  for (var i = 0; i < styles.length; i++) {
+    var v = styles[i];
+    var alt = (startRow + i) % 2 === altParity ? C_ALT : null;
+    bg.push([v ? v.bg : alt]);
+    fc.push([v ? v.fg : null]);
+    fw.push([v && v.bold ? 'bold' : 'normal']);
+  }
+  sheet.getRange(startRow, col, styles.length, 1)
+       .setBackgrounds(bg).setFontColors(fc).setFontWeights(fw);
+}
 function _colorEst(sheet, row, col, est, ff) {
   if (typeof est !== 'number' || ff <= 0) return;
   var ratio = est / ff;
@@ -1881,11 +1927,10 @@ function _colorEst(sheet, row, col, est, ff) {
   else                   cell.setBackground(C_GRN_BG).setFontColor(C_GRN_FG).setFontWeight('bold');
 }
 function _colorStatus(sheet, row, col, st) {
-  var cell = sheet.getRange(row, col);
-  if      (st === 'חריג מאוד') cell.setBackground(C_RED_BG).setFontColor(C_RED_FG).setFontWeight('bold');
-  else if (st === 'עמוס')      cell.setBackground(C_ORG_BG).setFontColor(C_ORG_FG).setFontWeight('bold');
-  else if (st === 'מתון')      cell.setBackground(C_YEL_BG).setFontColor(C_YEL_FG);
-  else if (st === 'תקין')      cell.setBackground(C_GRN_BG).setFontColor(C_GRN_FG);
+  var v = _statusStyle(st);
+  if (!v) return;
+  var cell = sheet.getRange(row, col).setBackground(v.bg).setFontColor(v.fg);
+  if (v.bold) cell.setFontWeight('bold');
 }
 function _autoWidth(sheet, nc) {
   for (var c = 1; c <= nc; c++) sheet.autoResizeColumn(c);
@@ -1900,14 +1945,28 @@ function _deviationLabel(currentJams, histAvgSec) {
   return { label: (pct >= 0 ? '+' : '') + pct + '%', pct: pct };
 }
 
+// Style lookups shared by the per-cell colorers and the batched sheet writers.
+// Return null when the value gets no special formatting.
+function _devStyle(pct) {
+  if (typeof pct !== 'number') return null;
+  if (pct > 50)   return { bg: C_RED_BG, fg: C_RED_FG, bold: true };
+  if (pct > 25)   return { bg: C_ORG_BG, fg: C_ORG_FG, bold: true };
+  if (pct > 10)   return { bg: C_YEL_BG, fg: C_YEL_FG, bold: true };
+  if (pct >= -10) return { bg: C_GRN_BG, fg: C_GRN_FG, bold: true };
+  return                 { bg: '#DBEAFE', fg: '#1E40AF', bold: true };
+}
+function _statusStyle(st) {
+  if (st === 'חריג מאוד') return { bg: C_RED_BG, fg: C_RED_FG, bold: true };
+  if (st === 'עמוס')      return { bg: C_ORG_BG, fg: C_ORG_FG, bold: true };
+  if (st === 'מתון')      return { bg: C_YEL_BG, fg: C_YEL_FG, bold: false };
+  if (st === 'תקין')      return { bg: C_GRN_BG, fg: C_GRN_FG, bold: false };
+  return null;
+}
+
 function _colorDeviation(sheet, row, col, pct) {
-  if (typeof pct !== 'number') return;
-  var cell = sheet.getRange(row, col);
-  if      (pct > 50)  cell.setBackground(C_RED_BG).setFontColor(C_RED_FG).setFontWeight('bold');
-  else if (pct > 25)  cell.setBackground(C_ORG_BG).setFontColor(C_ORG_FG).setFontWeight('bold');
-  else if (pct > 10)  cell.setBackground(C_YEL_BG).setFontColor(C_YEL_FG).setFontWeight('bold');
-  else if (pct >= -10) cell.setBackground(C_GRN_BG).setFontColor(C_GRN_FG).setFontWeight('bold');
-  else                cell.setBackground('#DBEAFE').setFontColor('#1E40AF').setFontWeight('bold');
+  var v = _devStyle(pct);
+  if (!v) return;
+  sheet.getRange(row, col).setBackground(v.bg).setFontColor(v.fg).setFontWeight('bold');
 }
 
 function _getJamsForStreets(jams, streets) {
@@ -1922,7 +1981,6 @@ function _stdev(arr) {
   return Math.sqrt(arr.reduce(function(s,x){return s+Math.pow(x-m,2);},0) / (arr.length-1));
 }
 function _tbin(h) { var b = Math.floor(h/4)*4; return _pad(b)+':00-'+_pad(b+4)+':00'; }
-function _pad(n) { return n < 10 ? '0'+n : ''+n; }
 function _round1(v) { return Math.round(v*10)/10; }
 
 // Day-of-week → 'weekday' | 'weekend'. Israeli convention: ו'+ש' are weekend.
@@ -2208,8 +2266,10 @@ function _nciStaticMapUrl(win, names) {
     if (!ring || !ring.length) return;
     var dev = devs[name] ? devs[name].devPct : null;
     var hex = _nciStatus(dev).fg.replace('#', '').toLowerCase();   // 6 lowercase hex digits (Geoapify is strict)
-    var pts = ring.map(function(p) { return p[1] + ',' + p[0]; });   // Geoapify wants lon,lat
-    pts.push(ring[0][1] + ',' + ring[0][0]);                          // close the ring
+    // Uniform fixed decimals — a value like 31.00 stringifies to "31", and Geoapify's
+    // coordinate validator rejected that bare integer ("does not match allowed types").
+    var pts = ring.map(function(p) { return p[1].toFixed(4) + ',' + p[0].toFixed(4); });   // lon,lat
+    pts.push(ring[0][1].toFixed(4) + ',' + ring[0][0].toFixed(4));    // close the ring
     geoms.push('polygon:' + pts.join(',') +
                ';linewidth:2;linecolor:%23' + hex + ';fillcolor:%23' + hex + ';fillopacity:0.45');
   });
@@ -2287,7 +2347,7 @@ function menuTestNCIMapImage() {
   var lines = ['⚠️ הכל ביחד: HTTP ' + full.code + ' (URL ' + full.len + ')', full.body, '', 'לכל אזור בנפרד:'];
   Object.keys(REGION_GEO).forEach(function(name) {
     var r = probe(_nciStaticMapUrl(win, [name]));
-    lines.push('• ' + name + ': HTTP ' + r.code + (r.code === 200 ? ' ✅ (' + r.body + ')' : ' ✗'));
+    lines.push('• ' + name + ': HTTP ' + r.code + (r.code === 200 ? ' ✅ (' + r.body + ')' : ' ✗ ' + r.body));
   });
   ui.alert(lines.join('\n'));
 }
@@ -3089,7 +3149,7 @@ function _sheet2_timebins(ss, jams, baselines) {
               'סטייה %','סטטוס'];
   _hdrRow(ws, cols, 2);
 
-  var row = 3;
+  var out = [], devStyles = [], stStyles = [];
   ROUTES.forEach(function(route) {
     [{label:route.dir1_label, streets:route.streets_dir1, ix:1},
      {label:route.dir2_label, streets:route.streets_dir2, ix:2}].forEach(function(dir) {
@@ -3146,18 +3206,19 @@ function _sheet2_timebins(ss, jams, baselines) {
         var hourLabel = _pad(g.hour) + ':00';
         var dtLabel = g.daytype === 'weekend' ? 'סופ"ש' : 'חול';
 
-        _dataRow(ws, row, [route.section, route.name, dir.label, hourLabel, dtLabel,
-                           jj.length, tl, td, asp, alv,
-                           _round1(curAvg/60), histMin, source, n,
-                           dev !== null ? (dev >= 0 ? '+' : '') + dev + '%' : '—',
-                           status],
-                 row % 2 === 0);
-        if (dev !== null) _colorDeviation(ws, row, 15, dev);
-        _colorStatus(ws, row, 16, status);
-        row++;
+        out.push([route.section, route.name, dir.label, hourLabel, dtLabel,
+                  jj.length, tl, td, asp, alv,
+                  _round1(curAvg/60), histMin, source, n,
+                  dev !== null ? (dev >= 0 ? '+' : '') + dev + '%' : '—',
+                  status]);
+        devStyles.push(_devStyle(dev));
+        stStyles.push(_statusStyle(status));
       });
     });
   });
+  _writeDataBlock(ws, 3, out, 0);
+  _styleColumn(ws, 3, 15, devStyles, 0);
+  _styleColumn(ws, 3, 16, stStyles, 0);
   _autoWidth(ws, cols.length);
   _tabIntro(ws, cols.length, 'הלב של הניתוח. שורה לכל מסלול × כיוון × שעה × סוג יום (חול/סופ"ש). "סטייה %" אומרת אם המצב כעת גרוע (חיובי) או טוב (שלילי) ביחס להיסטוריה באותה שעה. "מקור השוואה": "שעה זו" = השוואה מדויקת; "±1/±2 שעות" = הורחב כי אין מספיק דגימות; "—" = אין מספיק היסטוריה.', 1);
   ws.setFrozenRows(2);
@@ -3227,14 +3288,14 @@ function _sheet4_anomalies(ss, jams) {
     var sv = {קריטי:3,גבוה:2,בינוני:1};
     return (sv[b.sv]||0) - (sv[a.sv]||0) || b.dm - a.dm;
   });
-  var row = 3;
-  anoms.forEach(function(a, i) {
-    _dataRow(ws, row, [i+1, a.sec, a.rt, a.dir, a.seg, a.city, a.date, a.day, a.hour, a.tb,
-                       a.spd, a.ln, a.dm, a.am, a.dp+'%', a.lv, a.sv],
-             row % 2 === 1);
-    _colorStatus(ws, row, 17, a.sv==='קריטי'?'חריג מאוד':a.sv==='גבוה'?'עמוס':'מתון');
-    row++;
+  var out = anoms.map(function(a, i) {
+    return [i+1, a.sec, a.rt, a.dir, a.seg, a.city, a.date, a.day, a.hour, a.tb,
+            a.spd, a.ln, a.dm, a.am, a.dp+'%', a.lv, a.sv];
   });
+  _writeDataBlock(ws, 3, out, 1);
+  _styleColumn(ws, 3, 17, anoms.map(function(a) {
+    return _statusStyle(a.sv==='קריטי'?'חריג מאוד':a.sv==='גבוה'?'עמוס':'מתון');
+  }), 1);
   _autoWidth(ws, cols.length);
   _tabIntro(ws, cols.length, 'פקקים בודדים שבולטים מאוד בתוך הפילטר הנוכחי. הקריטריון מקומי (1.5σ מעל הממוצע, או speed<5, או level≥4) — לא היסטורי. ממוין לפי חומרה ואז גודל ההשהיה.', 1);
   ws.setFrozenRows(2);
@@ -3245,7 +3306,7 @@ function _sheet5_detail(ss, jams) {
   var cols = ['#','אזור','מסלול','כיוון','קטע','עיר','תאריך','יום','שעה','מרווח',
               'מהירות','אורך (מ\')','השהיה (שנ\')','זמן נסיעה (דק\')','רמת פקק'];
   _hdrRow(ws, cols, 2);
-  var row = 3, idx = 1;
+  var out = [];
   ROUTES.forEach(function(route) {
     [{label:route.dir1_label,streets:route.streets_dir1},
      {label:route.dir2_label,streets:route.streets_dir2}].forEach(function(dir) {
@@ -3253,15 +3314,14 @@ function _sheet5_detail(ss, jams) {
       var jl = _getJamsForStreets(jams, dir.streets);
       jl.sort(function(a,b){return new Date(a.pub_ts) - new Date(b.pub_ts);});
       jl.forEach(function(j) {
-        _dataRow(ws, row, [idx++, route.section, route.name, dir.label,
-                           j.sn+' → '+j.en, j.city, j.date, j.day,
-                           j.hour!==null?_pad(j.hour)+':00':'', j.tbin,
-                           j.speed, j.length_m, j.delay_s, j.tt_min, j.level],
-                 row % 2 === 1);
-        row++;
+        out.push([out.length + 1, route.section, route.name, dir.label,
+                  j.sn+' → '+j.en, j.city, j.date, j.day,
+                  j.hour!==null?_pad(j.hour)+':00':'', j.tbin,
+                  j.speed, j.length_m, j.delay_s, j.tt_min, j.level]);
       });
     });
   });
+  _writeDataBlock(ws, 3, out, 1);
   _autoWidth(ws, cols.length);
   _tabIntro(ws, cols.length, 'יומן מלא של כל הפקקים בפילטר הנוכחי — שורה לכל פקק יחיד. ממוין לפי מסלול → כיוון → זמן. שימושי לחפירה לעומק.', 1);
   ws.setFrozenRows(2);
@@ -3486,8 +3546,8 @@ function _rebuildAggregation(ss) {
               'השהיה ממוצעת (דק\')','מהירות ממוצעת','רמה ממוצעת'];
   _hdrRow(ws, cols, 3);
 
-  var row = 4;
-  for (var i = 0; i < rows.length; i++) {
+  var out = [];
+  for (var i = 0; i < rows.length && out.length < 5000; i++) {   // cap: show most recent 5K rows
     var r = rows[i];
     var route=r[0], dir=r[1], date=r[2], hour=r[3];
     var n=+r[4]||0, sumD=+r[5]||0, sumS=+r[6]||0, sumL=+r[7]||0;
@@ -3499,16 +3559,15 @@ function _rebuildAggregation(ss) {
     var avgD = _round1((sumD / n) / 60);
     var avgS = _round1(sumS / n);
     var avgL = _round1(sumL / n);
-    _dataRow(ws, row, [
+    out.push([
       dateStr, dt === 'weekend' ? 'סופ"ש' : 'חול',
       _periodFromDateHour(dateStr, hour),
       route, dirLabel[route+'::'+dir] || ('כיוון '+dir),
       _pad(hour)+':00',
       n, avgD, avgS, avgL
-    ], row % 2 === 0);
-    row++;
-    if (row > 5000) break;   // protect against huge archive — show most recent 5K rows
+    ]);
   }
+  _writeDataBlock(ws, 4, out, 0);
 
   _autoWidth(ws, cols.length);
   _tabIntro(ws, cols.length, 'תצוגה ישירה של הארכיון הקבוע _baseline_archive (כל ההיסטוריה, לא רק 30 הימים האחרונים). שורה לכל תאריך × מסלול × כיוון × שעה. ממוין מהחדש לישן. מציג עד 5,000 שורות.', 2);
